@@ -426,6 +426,16 @@
             color: #34d399;
             border: 1px solid rgba(16,185,129,0.2);
         }
+        .ci-section .ci-header .ci-badge.qianwen {
+            background: rgba(245,158,11,0.15);
+            color: #fbbf24;
+            border: 1px solid rgba(245,158,11,0.2);
+        }
+        .ci-section .ci-header .ci-badge.active-qianwen {
+            background: rgba(245,158,11,0.25);
+            border-color: #fbbf24;
+            box-shadow: 0 0 10px rgba(245,158,11,0.25);
+        }
         .ci-section .ci-header .ci-badge.online {
             background: rgba(96,165,250,0.15);
             color: #60a5fa;
@@ -552,6 +562,28 @@
 
     <!-- 大模型配置信息（可编辑） -->
     <div class="config-info" id="configInfo">
+        <!-- 千问配置 -->
+        <div class="ci-section" id="ciQianwen">
+            <div class="ci-header">
+                <span class="ci-badge qianwen active-qianwen" id="badgeQianwen">千问模型</span>
+                <span style="font-size:11px;color:rgba(255,255,255,0.2);">当前使用</span>
+            </div>
+            <div class="ci-field">
+                <span class="ci-label">地址</span>
+                <input type="text" id="ciQianwenUrl" value="http://10.192.218.202:7801/v1/chat/completions" placeholder="API 地址"/>
+            </div>
+            <div class="ci-field">
+                <span class="ci-label">Key</span>
+                <input type="text" id="ciQianwenKey" value="GKojYD_InnHO2D5RVG4Zsw86Fz-J4bf_72j8ZNEy-uDlT9UaVg" placeholder="API Key"/>
+            </div>
+            <div class="ci-field">
+                <span class="ci-label">模型</span>
+                <input type="text" id="ciQianwenModel" value="Qwen3.5-27B" placeholder="模型名称"/>
+            </div>
+            <div class="ci-actions">
+                <button class="btn-ci btn-ci-save" onclick="saveQianwenConfig()">保存</button>
+            </div>
+        </div>
         <!-- 本地配置 -->
         <div class="ci-section" id="ciLocal">
             <div class="ci-header">
@@ -597,7 +629,7 @@
             </div>
         </div>
     </div>
-    <div class="ci-status" id="ciStatus">当前模式：本地 · 可编辑上方配置后点击保存</div>
+    <div class="ci-status" id="ciStatus">当前模式：千问 · 可编辑上方配置后点击保存</div>
 
     <!-- 媒体区 -->
     <div id="media">
@@ -612,6 +644,7 @@
             <p>
                 输入文字 · 大模型
                 <span class="model-toggle">
+                    <button type="button" class="btn-mode active" id="btnModeQianwen">千问</button>
                     <button type="button" class="btn-mode" id="btnModeLocal">本地</button>
                     <button type="button" class="btn-mode" id="btnModeOnline">线上</button>
                 </span>
@@ -643,11 +676,11 @@
 
 </div>
 
-<script type="text/javascript" src="https://code.jquery.com/jquery-2.1.1.min.js"></script>
+<script type="text/javascript" src="jquery-2.1.1.min.js"></script>
 
 <script>
 // ===== DeepSeek 配置（初始值，页面加载后从 input 读取） =====
-var CURRENT_MODE = 'local'; // 'local' | 'online'
+var CURRENT_MODE = 'qianwen'; // 'qianwen' | 'local' | 'online'
 
 // ===== WebRTC（原始逻辑，未改动） =====
 var pc = null;
@@ -745,7 +778,13 @@ window.onbeforeunload = function (e) {
 var conversationHistory = [];
 
 function getCurrentConfig() {
-    if (CURRENT_MODE === 'local') {
+    if (CURRENT_MODE === 'qianwen') {
+        return {
+            url: document.getElementById('ciQianwenUrl').value.trim(),
+            key: document.getElementById('ciQianwenKey').value.trim(),
+            model: document.getElementById('ciQianwenModel').value.trim()
+        };
+    } else if (CURRENT_MODE === 'local') {
         return {
             url: document.getElementById('ciLocalUrl').value.trim(),
             key: document.getElementById('ciLocalKey').value.trim(),
@@ -853,29 +892,42 @@ function switchMode(mode) {
     CURRENT_MODE = mode;
 
     // 切换按钮高亮
+    $('#btnModeQianwen').toggleClass('active', mode === 'qianwen');
     $('#btnModeLocal').toggleClass('active', mode === 'local');
     $('#btnModeOnline').toggleClass('active', mode === 'online');
 
     // 配置区块高亮
+    var $qianwen = $('#ciQianwen');
     var $local = $('#ciLocal');
     var $online = $('#ciOnline');
+    var $badgeQianwen = $('#badgeQianwen');
     var $badgeLocal = $('#badgeLocal');
     var $badgeOnline = $('#badgeOnline');
 
-    if (mode === 'local') {
+    // 先全部置灰
+    $qianwen.css('opacity', '0.45');
+    $local.css('opacity', '0.45');
+    $online.css('opacity', '0.45');
+    $badgeQianwen.removeClass('active-qianwen active-local active-online').addClass('inactive');
+    $badgeLocal.removeClass('active-qianwen active-local active-online').addClass('inactive');
+    $badgeOnline.removeClass('active-qianwen active-local active-online').addClass('inactive');
+    $qianwen.find('.ci-header span:last-child').text('');
+    $local.find('.ci-header span:last-child').text('');
+    $online.find('.ci-header span:last-child').text('');
+
+    // 激活当前模式
+    if (mode === 'qianwen') {
+        $qianwen.css('opacity', '1');
+        $badgeQianwen.removeClass('inactive').addClass('active-qianwen');
+        $qianwen.find('.ci-header span:last-child').text('当前使用');
+    } else if (mode === 'local') {
         $local.css('opacity', '1');
-        $online.css('opacity', '0.45');
-        $badgeLocal.removeClass('inactive active-online').addClass('active-local');
-        $badgeOnline.removeClass('active-online active-local').addClass('inactive');
+        $badgeLocal.removeClass('inactive').addClass('active-local');
         $local.find('.ci-header span:last-child').text('当前使用');
-        $online.find('.ci-header span:last-child').text('');
     } else {
         $online.css('opacity', '1');
-        $local.css('opacity', '0.45');
-        $badgeOnline.removeClass('inactive active-local').addClass('active-online');
-        $badgeLocal.removeClass('active-local active-online').addClass('inactive');
+        $badgeOnline.removeClass('inactive').addClass('active-online');
         $online.find('.ci-header span:last-child').text('当前使用');
-        $local.find('.ci-header span:last-child').text('');
     }
 
     updateStatusText();
@@ -910,6 +962,20 @@ function saveOnlineConfig() {
     updateStatusText('✅ 线上配置已保存');
 }
 
+function saveQianwenConfig() {
+    var url = document.getElementById('ciQianwenUrl').value.trim();
+    var key = document.getElementById('ciQianwenKey').value.trim();
+    var model = document.getElementById('ciQianwenModel').value.trim();
+    if (!url || !key || !model) {
+        alert('请完整填写千问模型的 API 地址、Key 和模型名称');
+        return;
+    }
+    if (CURRENT_MODE === 'qianwen') {
+        quickTest(url, key, model);
+    }
+    updateStatusText('✅ 千问配置已保存');
+}
+
 function quickTest(url, key, model) {
     // 轻量测试：发送一条简单请求验证配置可用
     fetch(url, {
@@ -942,7 +1008,7 @@ function updateStatusText(msg) {
     if (msg) {
         el.textContent = msg;
     } else {
-        var modeLabel = CURRENT_MODE === 'local' ? '本地' : '线上';
+        var modeLabel = CURRENT_MODE === 'qianwen' ? '千问' : (CURRENT_MODE === 'local' ? '本地' : '线上');
         el.textContent = '当前模式：' + modeLabel + ' · 可编辑上方配置后点击保存';
     }
 }
@@ -1001,9 +1067,28 @@ function fillAndSubmit(text) {
 // --- 麦克风录音 ---
 function startRecording() {
     audioChunks = [];
+
+    // 安全检查：非 HTTPS/localhost 下 mediaDevices 可能不可用
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        setAsrStatus('麦克风不可用：页面需要通过 HTTPS 或 localhost 访问', 'error');
+        return Promise.reject(new Error('Insecure context: getUserMedia not available'));
+    }
+
     return navigator.mediaDevices.getUserMedia({ audio: true })
     .then(function(stream) {
-        mediaRecorder = new MediaRecorder(stream, { mimeType: MediaRecorder.isTypeSupported('audio/webm') ? 'audio/webm' : '' });
+        // 检查浏览器支持的音频编码格式
+        var mimeType = '';
+        if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+            mimeType = 'audio/webm;codecs=opus';
+        } else if (MediaRecorder.isTypeSupported('audio/webm')) {
+            mimeType = 'audio/webm';
+        } else if (MediaRecorder.isTypeSupported('audio/mp4')) {
+            mimeType = 'audio/mp4';
+        } else if (MediaRecorder.isTypeSupported('audio/ogg;codecs=opus')) {
+            mimeType = 'audio/ogg;codecs=opus';
+        }
+        // 如果都不支持，不传 mimeType 让浏览器自行决定
+        mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType: mimeType } : {});
         mediaRecorder.ondataavailable = function(e) {
             if (e.data.size > 0) audioChunks.push(e.data);
         };
@@ -1040,10 +1125,14 @@ function uploadAudioFile(file) {
 
 // ===== jQuery 逻辑（原始 + 新增大模型） =====
 $(document).ready(function() {
-    // 默认本地模式
-    switchMode('local');
+    // 默认千问模式
+    switchMode('qianwen');
 
     // 模式切换（用 jQuery 绑定，避免 form 内 onclick 问题）
+    $('#btnModeQianwen').on('click', function(e) {
+        e.preventDefault();
+        switchMode('qianwen');
+    });
     $('#btnModeLocal').on('click', function(e) {
         e.preventDefault();
         switchMode('local');
@@ -1059,7 +1148,9 @@ $(document).ready(function() {
         if (isRecording) {
             stopRecording();
         } else {
-            startRecording().catch(function() {});
+            startRecording().catch(function(err) {
+                appendMessage('system', '⚠️ 麦克风不可用: ' + err.message);
+            });
         }
     });
 
@@ -1098,7 +1189,7 @@ $(document).ready(function() {
             // 先检查配置是否完整
             var cfg = getCurrentConfig();
             if (!cfg.url || !cfg.key || !cfg.model) {
-                throw new Error('请先在「' + (CURRENT_MODE === 'local' ? '本地' : '线上') + '模型」中填写完整配置并保存');
+                throw new Error('请先在「' + (CURRENT_MODE === 'qianwen' ? '千问' : CURRENT_MODE === 'local' ? '本地' : '线上') + '模型」中填写完整配置并保存');
             }
 
             conversationHistory.push({ role: 'user', content: message });
