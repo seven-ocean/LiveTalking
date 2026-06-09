@@ -7,6 +7,15 @@ import json
 import os
 
 
+def str_to_bool(value):
+    """将字符串转换为 bool，支持 True/False/1/0"""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.lower() in ('true', '1', 'yes')
+    return bool(value)
+
+
 def str_or_int(value):
     """尝试转换为 int，失败则返回 str"""
     try:
@@ -17,7 +26,7 @@ def str_or_int(value):
 
 def parse_args():
     """解析命令行参数"""
-    parser = argparse.ArgumentParser(description="LiveTalking Digital Human Server")
+    parser = argparse.ArgumentParser(description="zl-talking Digital Human Server")
 
     # ─── 音频 ──────────────────────────────────────────────────────────
     parser.add_argument('--fps', type=int, default=25, help="video fps, must be 25")
@@ -37,6 +46,10 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=16, help="infer batch")
     parser.add_argument('--modelres', type=int, default=192)
     parser.add_argument('--modelfile', type=str, default='')
+    parser.add_argument('--use_onnx', action='store_true',
+                        help="use ONNX model instead of PyTorch (default: False)")
+    parser.add_argument('--onnx_model_path', type=str, default='',
+                        help="path to ONNX model file (default: auto-select based on --model)")
 
     # ─── 自定义动作和多形象 ────────────────────────────────────────────
     parser.add_argument('--customvideo_config', type=str, default='',
@@ -49,6 +62,10 @@ def parse_args():
                         help="参考文件名或语音模型ID")
     parser.add_argument('--REF_TEXT', type=str, default=None)
     parser.add_argument('--TTS_SERVER', type=str, default='http://127.0.0.1:9880')
+    parser.add_argument('--COSYVOICE_STREAMING', type=str_to_bool, default=False,
+                        help="启用 CosyVoice 流式推理（默认 False，传 True 开启）")
+    parser.add_argument('--COSYVOICE_STREAM_CHUNK', type=int, default=9600,
+                        help="流式音频块大小（字节），默认 9600 (约 200ms @ 24kHz)")
 
     # ─── 传输 ─────────────────────────────────────────────────────────
     parser.add_argument('--transport', type=str, default='webrtc',

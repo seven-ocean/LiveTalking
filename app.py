@@ -1,6 +1,6 @@
 ###############################################################################
-#  Copyright (C) 2024 LiveTalking@lipku https://github.com/lipku/LiveTalking
-#  email: lipku@foxmail.com
+#  Copyright (C) 2025 四川昱扬科技有限公司
+#
 # 
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -48,12 +48,15 @@ import random
 import shutil
 import asyncio
 import torch
+import os
 from io import BytesIO
 from typing import Dict
 from utils.logger import logger
 import copy
 import gc
 from dotenv import load_dotenv
+
+from utils.hardware_monitor import log_device_info, log_resource_usage, start_monitoring
 
 
 app = Flask(__name__)
@@ -120,6 +123,10 @@ async def download_record(request):
 
 def main():
     global rtc_manager, opt, model,load_avatar
+
+    log_device_info()
+    start_monitoring(interval=120)
+
     # 解析命令行参数
     from config import parse_args
     opt = parse_args()
@@ -137,12 +144,39 @@ def main():
     warm_up = avatar_mod.warm_up
     logger.info(opt)
 
+    # 自动设置默认 ONNX 路径
+    if opt.use_onnx and not opt.onnx_model_path:
+        if opt.model == 'musetalk':
+            opt.onnx_model_path = './models/onnx/musetalk/unet.onnx'
+            opt.vae_onnx_path = './models/onnx/musetalk/vae_decoder.onnx'
+        elif opt.model == 'wav2lip':
+            opt.onnx_model_path = './models/onnx/wav2lip/wav2lip.onnx'
+        logger.info(f"Auto-selected ONNX model path: {opt.onnx_model_path}")
+
     if opt.model == 'musetalk':
-        model = load_model()
+        if opt.use_onnx:
+            # 使用 ONNX 模型
+            from avatars.musetalk_avatar import load_onnx_model
+            # 检查 VAE ONNX 是否存在，如果存在则一起加载
+            vae_onnx_path = getattr(opt, 'vae_onnx_path', None)
+            model = load_onnx_model(opt.onnx_model_path, vae_onnx_path)
+            logger.info(f"Using MuseTalk ONNX model: {opt.onnx_model_path}")
+            if vae_onnx_path and os.path.exists(vae_onnx_path):
+                logger.info(f"Using MuseTalk VAE ONNX model: {vae_onnx_path}")
+        else:
+            # 使用 PyTorch 模型
+            model = load_model()
         global_avatars[opt.avatar_id] = load_avatar(opt.avatar_id) 
         warm_up(opt.batch_size,model)      
     elif opt.model == 'wav2lip':
-        model = load_model("./models/wav2lip.pth")
+        if opt.use_onnx:
+            # 使用 ONNX 模型
+            from avatars.wav2lip_avatar import load_onnx_model
+            model = load_onnx_model(opt.onnx_model_path)
+            logger.info(f"Using Wav2Lip ONNX model: {opt.onnx_model_path}")
+        else:
+            # 使用 PyTorch 模型
+            model = load_model("./models/wav2lip/wav2lip.pth")
         global_avatars[opt.avatar_id] = load_avatar(opt.avatar_id)
         warm_up(opt.batch_size,model,256)
     elif opt.model == 'ultralight':

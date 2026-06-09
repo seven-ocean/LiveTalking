@@ -1,6 +1,6 @@
 ###############################################################################
-#  Copyright (C) 2024 LiveTalking@lipku https://github.com/lipku/LiveTalking
-#  email: lipku@foxmail.com
+#  Copyright (C) 2025 四川昱扬科技有限公司
+#
 # 
 #  Licensed under the Apache License, Version 2.0 (the "License");
 #  you may not use this file except in compliance with the License.
@@ -69,6 +69,71 @@ def load_model(path):
 
     model = model.to(device)
     return model.eval()
+
+
+class ONNXWav2LipWrapper:
+    """ONNX 模型包装器，提供与 PyTorch 模型相同的接口"""
+    def __init__(self, onnx_path):
+        import onnxruntime as ort
+        self.onnx_path = onnx_path
+        logger.info(f"Loading ONNX model from: {onnx_path}")
+        
+        # 配置 ONNX Runtime — 自动适配 NVIDIA CUDA / 沐曦 MACA / CPU
+        from utils.device import get_onnx_providers
+        providers = get_onnx_providers()
+        logger.info(f"ONNX Runtime available providers: {ort.get_available_providers()}")
+        logger.info(f"Trying to use providers: {providers}")
+        self.session = ort.InferenceSession(onnx_path, providers=providers)
+        
+        # 获取实际使用的 provider
+        actual_providers = self.session.get_providers()
+        logger.info(f"ONNX model actually using providers: {actual_providers}")
+        
+        # 获取输入输出信息
+        self.input_names = [inp.name for inp in self.session.get_inputs()]
+        self.output_names = [out.name for out in self.session.get_outputs()]
+        logger.info(f"ONNX model inputs: {self.input_names}")
+        logger.info(f"ONNX model outputs: {self.output_names}")
+    
+    def __call__(self, audio_sequences, face_sequences):
+        """推理接口，兼容 PyTorch 模型调用方式"""
+        import numpy as np
+        
+        # 将 torch.Tensor 转换为 numpy
+        if isinstance(audio_sequences, torch.Tensor):
+            audio_np = audio_sequences.cpu().numpy()
+        else:
+            audio_np = audio_sequences
+            
+        if isinstance(face_sequences, torch.Tensor):
+            face_np = face_sequences.cpu().numpy()
+        else:
+            face_np = face_sequences
+        
+        # 运行推理
+        outputs = self.session.run(
+            None,
+            {
+                self.input_names[0]: audio_np,
+                self.input_names[1]: face_np
+            }
+        )
+        
+        # 将输出转换回 torch.Tensor
+        return torch.from_numpy(outputs[0]).to(device)
+    
+    def eval(self):
+        """兼容接口，ONNX 模型不需要 eval 模式"""
+        return self
+    
+    def to(self, device):
+        """兼容接口，ONNX 模型在 session 创建时已确定设备"""
+        return self
+
+
+def load_onnx_model(onnx_path):
+    """加载 ONNX 格式的 Wav2Lip 模型"""
+    return ONNXWav2LipWrapper(onnx_path)
 
 def load_avatar(avatar_id):
     avatar_path = f"./data/avatars/{avatar_id}"
@@ -146,4 +211,3 @@ class LipReal(BaseAvatar):
         res_frame = cv2.resize(pred_frame.astype(np.uint8),(x2-x1,y2-y1))
         combine_frame[y1:y2, x1:x2] = res_frame
         return combine_frame
-
