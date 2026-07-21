@@ -85,3 +85,7 @@ def parse_args():
             opt.customopt = json.load(f)
 
     return opt
+
+
+# ---- 调试日志开关 ----
+DEBUG_WAV2LIP_FACE_DETECTION = True   # wav2lip genavatar 人脸检测详细日志，定位问题后设为 False

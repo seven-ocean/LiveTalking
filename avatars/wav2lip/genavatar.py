@@ -2,11 +2,13 @@ from os import listdir, path
 import numpy as np
 import scipy, cv2, os, sys, argparse
 import json, subprocess, random, string
+import time
 from tqdm import tqdm
 from glob import glob
 import torch
 import pickle
 from avatars.wav2lip import face_detection
+from config import DEBUG_WAV2LIP_FACE_DETECTION
 
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -81,17 +83,33 @@ def generate_avatar(video_path, avatar_id, save_path='./data/avatars', img_size=
     if progress_callback: progress_callback(40)
 
     print('正在检测人脸...')
+    _t_init_start = time.perf_counter()
     detector = face_detection.FaceAlignment(face_detection.LandmarksType._2D,
                                             flip_input=False, device=device)
+    _t_init_end = time.perf_counter()
+    if DEBUG_WAV2LIP_FACE_DETECTION:
+        print(f"  [genavatar] FaceAlignment init time: {_t_init_end - _t_init_start:.3f}s")
 
     batch_size = face_det_batch_size
     predictions = []
+    total_batches = (len(frames) + batch_size - 1) // batch_size
+    batch_idx = 0
 
     while 1:
         predictions = []
         try:
             for i in range(0, len(frames), batch_size):
-                predictions.extend(detector.get_detections_for_batch(np.array(frames[i:i + batch_size])))
+                batch_idx += 1
+                _t_batch_start = time.perf_counter()
+                batch_frames = np.array(frames[i:i + batch_size])
+                if DEBUG_WAV2LIP_FACE_DETECTION:
+                    print(f"  [genavatar] batch {batch_idx}/{total_batches}: frames {i}~{min(i + batch_size, len(frames)) - 1} ({batch_frames.shape[0]} frames, {batch_frames.shape[1]}x{batch_frames.shape[2]})")
+                detections = detector.get_detections_for_batch(batch_frames)
+                predictions.extend(detections)
+                _t_batch_end = time.perf_counter()
+                if DEBUG_WAV2LIP_FACE_DETECTION:
+                    batch_face_count = sum(1 for d in detections if d is not None)
+                    print(f"  [genavatar] batch {batch_idx} done: {batch_face_count}/{batch_frames.shape[0]} faces, time={_t_batch_end - _t_batch_start:.3f}s")
                 if progress_callback:
                     progress = 40 + int((i + batch_size) / len(frames) * 40)
                     progress_callback(min(progress, 80))
@@ -99,6 +117,8 @@ def generate_avatar(video_path, avatar_id, save_path='./data/avatars', img_size=
             if batch_size == 1:
                 raise RuntimeError('Image too big to run face detection on GPU.')
             batch_size //= 2
+            total_batches = (len(frames) + batch_size - 1) // batch_size
+            batch_idx = 0
             print('Recovering from OOM error; New batch size: {}'.format(batch_size))
             continue
         break

@@ -75,7 +75,19 @@ pip install -r requirements.txt
 | musetalk | Same as above | `models/musetalk/` |
 | Avatar Assets | Same as above | `data/avatars/<avatar_id>/` |
 
-### 2. Start Server
+### 2. Generate Avatar Assets
+
+```bash
+# wav2lip (use default batch_size for low-res videos)
+python -m avatars.wav2lip.genavatar --video_path data/wav2lip256_avatar3.mp4 --img_size 256 --avatar_id wav2lip256_avatar3
+
+# For high-resolution videos (e.g. 1080p), reduce face_det_batch_size to avoid OOM or hanging
+python -m avatars.wav2lip.genavatar --video_path data/xxxx.mp4 --img_size 256 --avatar_id xxxx --face_det_batch_size 4
+```
+
+> **Note**: The face detection stage (S3FD) in `genavatar` is sensitive to the original video resolution. A single 1080p frame takes ~2s of GPU time. With the default batch_size=16, loading 16 frames at once may cause OOM or long hangs. **If you encounter this issue, add `--face_det_batch_size 4` (or lower) to reduce per-batch processing.**
+
+### 3. Start Server
 
 ```bash
 # wav2lip + WebRTC

@@ -1,5 +1,6 @@
 from __future__ import print_function
 import os
+import time
 import torch
 from torch.utils.model_zoo import load_url
 from enum import Enum
@@ -12,6 +13,7 @@ except BaseException:
 
 from .models import FAN, ResNetDepth
 from .utils import *
+from config import DEBUG_WAV2LIP_FACE_DETECTION
 
 
 class LandmarksType(Enum):
@@ -62,6 +64,11 @@ class FaceAlignment:
         self.face_detector = face_detector_module.FaceDetector(device=device, verbose=verbose)
 
     def get_detections_for_batch(self, images):
+        _t = time.perf_counter()
+        n_images = images.shape[0]
+        if DEBUG_WAV2LIP_FACE_DETECTION:
+            print(f"  [FaceAlignment] get_detections_for_batch: {n_images} images")
+
         images = images[..., ::-1]
         detected_faces = self.face_detector.detect_from_batch(images.copy())
         results = []
@@ -76,4 +83,7 @@ class FaceAlignment:
             x1, y1, x2, y2 = map(int, d[:-1])
             results.append((x1, y1, x2, y2))
 
+        if DEBUG_WAV2LIP_FACE_DETECTION:
+            face_count = sum(1 for r in results if r is not None)
+            print(f"  [FaceAlignment] get_detections_for_batch done: {face_count}/{n_images} faces detected, time={time.perf_counter() - _t:.3f}s")
         return results

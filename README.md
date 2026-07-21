@@ -69,7 +69,19 @@ pip install -r requirements.txt
 | musetalk | 同上 | `models/musetalk/` |
 | 形象素材 | 同上 | `data/avatars/<avatar_id>/` |
 
-### 2. 启动服务
+### 2. 生成形象素材
+
+```bash
+# wav2lip（低分辨率视频建议使用默认 batch_size）
+python -m avatars.wav2lip.genavatar --video_path data/wav2lip256_avatar3.mp4 --img_size 256 --avatar_id wav2lip256_avatar3
+
+# 如果视频分辨率较高（如 1080p），请减小 face_det_batch_size 避免显存溢出或卡死
+python -m avatars.wav2lip.genavatar --video_path data/xxxx.mp4 --img_size 256 --avatar_id xxxx --face_det_batch_size 4
+```
+
+> **注意**：`genavatar` 的人脸检测阶段（S3FD）对输入视频的原始分辨率敏感。1080p 视频单帧推理约需 2s GPU 时间，默认 batch_size=16 时一次加载 16 帧可能导致显存溢出或长时间卡死。**遇到此问题时请加 `--face_det_batch_size 4`（或更小值）降低每批处理量。**
+
+### 3. 启动服务
 
 ```bash
 # wav2lip + WebRTC
