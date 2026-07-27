@@ -69,6 +69,7 @@ class BaseAvatar:
 
         self.speaking = False
         self.recording = False
+        self.interrupted = False      # 打断标志，供 put_audio_file 循环检查
         self._record_video_pipe = None
         self._record_audio_pipe = None
         self.width = self.height = 0
@@ -132,12 +133,17 @@ class BaseAvatar:
             self.asr.put_audio_frame(audio_chunk, datainfo)
 
     def put_audio_file(self, filebyte, datainfo:dict={}): 
+        self.interrupted = False  # 每个新文件开始时重置
         input_stream = BytesIO(filebyte)
         stream = self.__create_bytes_stream(input_stream)
         streamlen = stream.shape[0]
         idx = 0
         first = True
         while streamlen >= self.chunk:
+            if self.interrupted:
+                self.interrupted = False
+                logger.info(f'[INFO] put_audio_file interrupted by flush_talk, remaining {streamlen} samples')
+                break
             eventpoint = {}
             if first:
                 eventpoint = {'status': 'start'}
@@ -150,11 +156,16 @@ class BaseAvatar:
             idx += self.chunk
 
     def put_audio_filepath(self, filepath, datainfo:dict={}): 
+        self.interrupted = False  # 每个新文件开始时重置
         stream = self.__create_bytes_stream(filepath)
         streamlen = stream.shape[0]
         idx = 0
         first = True
         while streamlen >= self.chunk:
+            if self.interrupted:
+                self.interrupted = False
+                logger.info(f'[INFO] put_audio_filepath interrupted by flush_talk, remaining {streamlen} samples')
+                break
             eventpoint = {}
             if first:
                 eventpoint = {'status': 'start'}
@@ -186,7 +197,29 @@ class BaseAvatar:
             self.tts.flush_talk()
         if hasattr(self, 'asr') and hasattr(self.asr, 'flush_talk'):
             self.asr.flush_talk()
-        self.custom_audiotype = 0  
+        self.custom_audiotype = 0
+        self.interrupted = True                     # 设置打断标志
+        # 清空 mel 特征队列，防止 inference 线程读到旧 mel chunks 导致 ONNX shape mismatch
+        while not self.asr.feat_queue.empty():
+            try:
+                self.asr.feat_queue.get_nowait()
+            except queue.Empty:
+                break
+        # 清空音频帧输出队列，防止 inference 线程读到旧 audio frames
+        while not self.asr.output_queue.empty():
+            try:
+                self.asr.output_queue.get_nowait()
+            except queue.Empty:
+                break
+        # 清空渲染帧队列中的残留帧（避免旧 TTS 帧继续渲染）
+        while not self.res_frame_queue.empty():
+            try:
+                self.res_frame_queue.get_nowait()
+            except queue.Empty:
+                break
+        # 清空 MelASR 音频帧滑动窗口，避免新旧音频混合导致口型异常
+        if hasattr(self, 'asr') and hasattr(self.asr, 'frames'):
+            self.asr.frames.clear()
 
     # def flush(self):
     #     self.flush_talk()
@@ -340,6 +373,19 @@ class BaseAvatar:
                 if audioframe.type == 0:
                     is_all_silence = False               
                 audio_frames.append(audioframe)
+
+            # 防御：检测 mel 特征 batch size 是否匹配，防止 flush_talk 后
+            # feat_queue/output_queue 清空不彻底导致 ONNX shape mismatch 崩溃
+            if len(audiofeat_batch) != self.batch_size:
+                logger.warning(f'[WARN] audio feat batch size mismatch: got {len(audiofeat_batch)}, expected {self.batch_size}. Treating as silence.')
+                # 强制所有音频帧为静音类型，确保 process_frames 走静音分支而非 paste_back_frame
+                for af in audio_frames:
+                    af.type = 1
+                for i in range(self.batch_size):
+                    idx = mirror_index(length, index)
+                    self.res_frame_queue.put((None, audio_frames[i*2:i*2+2], idx))
+                    index = index + 1
+                continue
 
              # 检测状态变化
             current_speaking = not is_all_silence
