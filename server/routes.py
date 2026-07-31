@@ -150,6 +150,25 @@ async def is_speaking(request):
     return json_ok(data=avatar_session.is_speaking())
 
 
+async def client_config(request):
+    """客户端：获取 WebRTC 等可安全暴露的配置。
+
+    返回 ICE 服务器列表（含 TURN 凭据，供客户端直接用于 RTCPeerConnection）、
+    ICE 收集超时时间等。生产环境如需隐藏 TURN 凭据，应改用短时凭证服务。
+    """
+    try:
+        opt = request.app.get("opt")
+        if not opt:
+            return json_error("Config not found")
+        return json_ok(data={
+            "ice_servers": getattr(opt, "ice_servers", [{"urls": "stun:stun.freeswitch.org:3478"}]),
+            "ice_gathering_timeout": getattr(opt, "ice_gathering_timeout", 5.0),
+        })
+    except Exception as e:
+        logger.exception('client_config exception:')
+        return json_error(str(e))
+
+
 async def admin_config(request):
     """Admin: 获取全局配置参数"""
     try:
@@ -190,6 +209,24 @@ async def admin_sessions(request):
         return json_error(str(e))
 
 
+async def stop_session(request):
+    """显式停止并释放指定会话资源"""
+    try:
+        params = await request.json()
+        sessionid = params.get('sessionid', '')
+        session_manager.stop_session(sessionid)
+        session_manager.remove_session(sessionid)
+        return json_ok()
+    except Exception as e:
+        logger.exception('stop_session exception:')
+        return json_error(str(e))
+
+
+async def health(request):
+    """健康检查：快速返回当前会话数量，用于诊断事件循环是否存活"""
+    return json_ok(data={"sessions": len(session_manager.sessions)})
+
+
 # ─── 路由注册 ──────────────────────────────────────────────────────────────
 
 def setup_routes(app):
@@ -200,8 +237,11 @@ def setup_routes(app):
     app.router.add_post("/record", record)
     app.router.add_post("/interrupt_talk", interrupt_talk)
     app.router.add_post("/is_speaking", is_speaking)
+    app.router.add_get("/config", client_config)
     app.router.add_get("/api/admin/config", admin_config)
     app.router.add_get("/api/admin/sessions", admin_sessions)
+    app.router.add_post("/stop_session", stop_session)
+    app.router.add_get("/health", health)
 
     # 注册 avatar 生成相关的路由
     setup_avatar_routes(app)

@@ -74,6 +74,21 @@
         .param-hint { font-size: 0.75rem; color: #94a3b8; }
         ::placeholder { color: #9ca3af !important; opacity: 1; }
         :-ms-input-placeholder { color: #9ca3af; }
+        #webrtcLogs {
+            background: #0f172a;
+            color: #e2e8f0;
+            font-family: 'SFMono-Regular', Consolas, monospace;
+            font-size: 0.78rem;
+            max-height: 260px;
+            overflow-y: auto;
+            padding: 10px;
+            border-radius: 8px;
+        }
+        .log-time { color: #94a3b8; margin-right: 6px; }
+        .log-info { color: #38bdf8; }
+        .log-warn { color: #fbbf24; }
+        .log-error { color: #f87171; }
+        .log-debug { color: #a5b4fc; }
     </style>
 </head>
 <body>
@@ -142,13 +157,25 @@
                             <input type="text" class="form-control form-control-sm" id="offerRefText" placeholder="参考文本（可选）">
                         </div>
                     </div>
-                    <div class="d-flex gap-2">
+                    <div class="d-flex gap-2 flex-wrap align-items-center">
                         <button class="btn-primary-custom" id="btnStart" onclick="start()"><i class="bi bi-play-fill"></i> 开始连接</button>
                         <button class="btn-danger-custom" id="btnStop" onclick="stop()" style="display:none;"><i class="bi bi-stop-fill"></i> 断开连接</button>
+                        <span id="webrtcState" class="small text-muted">等待开始...</span>
                     </div>
                     <div class="mt-3">
                         <video id="video" autoplay playsinline muted controls></video>
                         <audio id="audio" autoplay></audio>
+                    </div>
+                </div>
+            </div>
+
+            <!-- WebRTC Diagnostics -->
+            <div class="glass-card">
+                <div class="card-header"><i class="bi bi-journal-text"></i> WebRTC 诊断日志</div>
+                <div class="card-body">
+                    <div id="webrtcLogs"></div>
+                    <div class="d-flex gap-2 mt-2">
+                        <button class="btn-outline-custom btn-sm" onclick="clearLogs()"><i class="bi bi-trash"></i> 清空日志</button>
                     </div>
                 </div>
             </div>
@@ -222,15 +249,56 @@
 <script>
 let pc = null;
 let sessionid = null;
+let clientConfig = null;
+let logContainer = null;
+
+const LOG_LEVELS = { debug: 'log-debug', info: 'log-info', warn: 'log-warn', error: 'log-error' };
+
+function initLogContainer() {
+    if (!logContainer) logContainer = document.getElementById('webrtcLogs');
+}
+
+function log(level, message, data) {
+    initLogContainer();
+    const time = new Date().toLocaleTimeString();
+    const line = document.createElement('div');
+    line.className = 'mb-1';
+    let html = `<span class="log-time">${time}</span><span class="${LOG_LEVELS[level] || LOG_LEVELS.info}">[${level.toUpperCase()}] ${escapeHtml(message)}</span>`;
+    if (data !== undefined) {
+        html += `<div style="padding-left: 12px; color: #cbd5e1;">${escapeHtml(typeof data === 'object' ? JSON.stringify(data) : String(data))}</div>`;
+    }
+    line.innerHTML = html;
+    logContainer.appendChild(line);
+    logContainer.scrollTop = logContainer.scrollHeight;
+
+    // 同时输出到浏览器控制台
+    const consoleMethod = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
+    consoleMethod(`[WebRTC ${level}] ${message}`, data !== undefined ? data : '');
+}
+
+function escapeHtml(text) {
+    if (text === null || text === undefined) return '';
+    return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
+function clearLogs() {
+    if (logContainer) logContainer.innerHTML = '';
+}
 
 function updateStatus(connected) {
     const badge = document.getElementById('statusBadge');
     if (connected) {
         badge.className = 'session-badge connected';
         badge.innerHTML = '<span class="status-dot on"></span>已连接';
+        document.getElementById('webrtcState').textContent = '已连接';
     } else {
         badge.className = 'session-badge disconnected';
         badge.innerHTML = '<span class="status-dot off"></span>未连接';
+        document.getElementById('webrtcState').textContent = '未连接';
     }
 }
 
@@ -239,61 +307,186 @@ function setSessionId(sid) {
     document.getElementById('sessionIdDisplay').textContent = 'SID: ' + (sid || '-');
 }
 
-// ─── WebRTC ────────────────────────────────────────────────
-function negotiate() {
-    pc.addTransceiver('video', { direction: 'recvonly' });
-    pc.addTransceiver('audio', { direction: 'recvonly' });
-    return pc.createOffer().then(offer => pc.setLocalDescription(offer)).then(() => {
-        return new Promise(resolve => {
-            if (pc.iceGatheringState === 'complete') resolve();
-            else {
-                const check = () => { if (pc.iceGatheringState === 'complete') { pc.removeEventListener('icegatheringstatechange', check); resolve(); } };
-                pc.addEventListener('icegatheringstatechange', check);
-            }
-        });
-    }).then(() => {
-        const offer = pc.localDescription;
-        const body = {
-            sdp: offer.sdp,
-            type: offer.type,
-            avatar: document.getElementById('offerAvatar').value || undefined,
-            refaudio: document.getElementById('offerRefAudio').value || undefined,
-            reftext: document.getElementById('offerRefText').value || undefined,
-        };
-        return fetch('/offer', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
-    }).then(res => res.json()).then(answer => {
-        if (answer.sessionid) setSessionId(answer.sessionid);
-        return pc.setRemoteDescription(new RTCSessionDescription({ type: 'answer', sdp: answer.sdp }));
-    }).catch(e => console.error('Negotiation error:', e));
+function setError(message) {
+    log('error', message);
+    document.getElementById('webrtcState').textContent = '错误: ' + message;
 }
 
-function start() {
-    const config = { sdpSemantics: 'unified-plan' };
-    if (document.getElementById('use-stun')?.checked) {
-        config.iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
+// 页面加载时获取服务端配置
+async function loadConfig() {
+    try {
+        const res = await fetch('/config');
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        const data = await res.json();
+        if (data.code !== 0 || !data.data) throw new Error('Invalid config response');
+        clientConfig = data.data;
+        log('info', 'Loaded server config', { ice_servers: clientConfig.ice_servers, ice_gathering_timeout: clientConfig.ice_gathering_timeout });
+    } catch (e) {
+        log('warn', 'Failed to load /config, fallback to default STUN', e.message);
+        clientConfig = {
+            ice_servers: [{ urls: 'stun:stun.l.google.com:19302' }],
+            ice_gathering_timeout: 5000,
+        };
     }
+}
+
+// ─── WebRTC ────────────────────────────────────────────────
+async function negotiate() {
+    const iceTimeout = (clientConfig && clientConfig.ice_gathering_timeout) || 5000;
+    const candidates = [];
+
+    pc.addTransceiver('video', { direction: 'recvonly' });
+    pc.addTransceiver('audio', { direction: 'recvonly' });
+
+    // 在 setLocalDescription 前先注册 ICE 事件监听，避免漏掉早期候选
+    const onIceCandidate = (evt) => {
+        if (evt.candidate) {
+            candidates.push(evt.candidate);
+            log('debug', 'ICE candidate gathered', { type: evt.candidate.type, protocol: evt.candidate.protocol, address: evt.candidate.address });
+        } else {
+            log('info', 'ICE candidate gathering complete (null candidate)', { total: candidates.length });
+        }
+    };
+    const onIceGatheringStateChange = () => {
+        log('info', 'ICE gathering state changed', pc.iceGatheringState);
+    };
+    pc.addEventListener('icecandidate', onIceCandidate);
+    pc.addEventListener('icegatheringstatechange', onIceGatheringStateChange);
+
+    log('info', 'Creating offer');
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    log('info', 'Local description set');
+
+    // 等待 ICE 收集完成或超时
+    await new Promise(resolve => {
+        let timer = null;
+        const check = () => {
+            if (pc.iceGatheringState === 'complete') {
+                if (timer) clearTimeout(timer);
+                pc.removeEventListener('icegatheringstatechange', check);
+                resolve();
+            }
+        };
+        timer = setTimeout(() => {
+            pc.removeEventListener('icegatheringstatechange', check);
+            log('warn', `ICE gathering timeout after ${iceTimeout}ms, sending offer with ${candidates.length} candidate(s)`);
+            resolve();
+        }, iceTimeout);
+        pc.addEventListener('icegatheringstatechange', check);
+        // 立即检查一次，防止已经 complete
+        if (pc.iceGatheringState === 'complete') {
+            clearTimeout(timer);
+            pc.removeEventListener('icegatheringstatechange', check);
+            resolve();
+        }
+    });
+
+    // 一次性 ICE 候选收集监听已完成使命，移除避免泄漏
+    pc.removeEventListener('icecandidate', onIceCandidate);
+
+    const localOffer = pc.localDescription;
+    log('info', 'Sending offer', { type: localOffer.type, candidates: candidates.length });
+
+    const body = {
+        sdp: localOffer.sdp,
+        type: localOffer.type,
+        avatar: document.getElementById('offerAvatar').value || undefined,
+        refaudio: document.getElementById('offerRefAudio').value || undefined,
+        reftext: document.getElementById('offerRefText').value || undefined,
+    };
+
+    const res = await fetch('/offer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+    });
+
+    log('info', 'Offer response status', res.status);
+    if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`Server returned ${res.status}: ${text}`);
+    }
+
+    const answer = await res.json();
+    log('info', 'Offer answer received', { sessionid: answer.sessionid, type: answer.type });
+
+    if (answer.code !== undefined && answer.code !== 0) {
+        throw new Error(`Server error: ${answer.msg || JSON.stringify(answer)}`);
+    }
+
+    if (answer.sessionid) setSessionId(answer.sessionid);
+    await pc.setRemoteDescription(new RTCSessionDescription({ type: answer.type, sdp: answer.sdp }));
+    log('info', 'Remote description set');
+}
+
+async function start() {
+    if (pc) {
+        log('warn', 'Connection already exists, stopping first');
+        stop();
+    }
+
+    const config = { sdpSemantics: 'unified-plan' };
+    if (clientConfig && clientConfig.ice_servers && clientConfig.ice_servers.length > 0) {
+        config.iceServers = clientConfig.ice_servers;
+        log('info', 'Using ICE servers from server config', clientConfig.ice_servers.map(s => s.urls || s.url));
+    } else {
+        config.iceServers = [{ urls: 'stun:stun.l.google.com:19302' }];
+        log('warn', 'No ICE servers configured, fallback to Google STUN');
+    }
+
     pc = new RTCPeerConnection(config);
+
     pc.addEventListener('track', evt => {
+        log('info', 'Remote track received', { kind: evt.track.kind, id: evt.track.id });
         if (evt.track.kind === 'video') document.getElementById('video').srcObject = evt.streams[0];
         else document.getElementById('audio').srcObject = evt.streams[0];
     });
+
     pc.addEventListener('connectionstatechange', () => {
+        log('info', 'Connection state changed', pc.connectionState);
         if (pc.connectionState === 'connected') updateStatus(true);
-        else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') { updateStatus(false); setSessionId(null); }
+        else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+            updateStatus(false);
+            setSessionId(null);
+            if (pc.connectionState === 'failed') setError('WebRTC connection failed');
+        }
     });
-    negotiate();
+
+    pc.addEventListener('iceconnectionstatechange', () => {
+        log('info', 'ICE connection state changed', pc.iceConnectionState);
+    });
+
+    pc.addEventListener('signalingstatechange', () => {
+        log('info', 'Signaling state changed', pc.signalingState);
+    });
+
+    document.getElementById('webrtcState').textContent = '连接中...';
     document.getElementById('btnStart').style.display = 'none';
     document.getElementById('btnStop').style.display = 'inline-block';
+
+    try {
+        await negotiate();
+    } catch (e) {
+        setError('Negotiation failed: ' + e.message);
+        console.error('Negotiation error:', e);
+        stop();
+    }
 }
 
 function stop() {
-    if (pc) { pc.close(); pc = null; }
+    if (pc) {
+        pc.close();
+        pc = null;
+    }
     updateStatus(false);
     setSessionId(null);
     document.getElementById('btnStart').style.display = 'inline-block';
     document.getElementById('btnStop').style.display = 'none';
     document.getElementById('video').srcObject = null;
     document.getElementById('audio').srcObject = null;
+    document.getElementById('webrtcState').textContent = '已断开';
+    log('info', 'Connection stopped');
 }
 
 // ─── Text ──────────────────────────────────────────────────
@@ -308,9 +501,9 @@ function sendText() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ text, type, interrupt, sessionid: String(sessionid) }),
     }).then(r => r.json()).then(d => {
-        console.log('human:', d);
+        log('info', '/human response', d);
         document.getElementById('txtMessage').value = '';
-    });
+    }).catch(e => log('error', '/human failed', e.message));
 }
 
 // ─── Audio Upload ──────────────────────────────────────────
@@ -323,7 +516,8 @@ function uploadAudio() {
     formData.append('sessionid', String(sessionid));
 
     fetch('/humanaudio', { method: 'POST', body: formData })
-        .then(r => r.json()).then(d => console.log('humanaudio:', d));
+        .then(r => r.json()).then(d => log('info', '/humanaudio response', d))
+        .catch(e => log('error', '/humanaudio failed', e.message));
 }
 
 // ─── Interrupt ─────────────────────────────────────────────
@@ -333,7 +527,8 @@ function interrupt() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sessionid: String(sessionid) }),
-    }).then(r => r.json()).then(d => console.log('interrupt:', d));
+    }).then(r => r.json()).then(d => log('info', '/interrupt_talk response', d))
+      .catch(e => log('error', '/interrupt_talk failed', e.message));
 }
 
 // ─── Speaking Status ───────────────────────────────────────
@@ -343,7 +538,10 @@ function checkSpeaking() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ sessionid: String(sessionid) }),
-    }).then(r => r.json()).then(d => alert('Speaking: ' + JSON.stringify(d.data)));
+    }).then(r => r.json()).then(d => {
+        log('info', '/is_speaking response', d);
+        alert('Speaking: ' + JSON.stringify(d.data));
+    }).catch(e => log('error', '/is_speaking failed', e.message));
 }
 
 // ─── Recording ─────────────────────────────────────────────
@@ -357,7 +555,7 @@ function toggleRecord() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ type, sessionid: String(sessionid) }),
     }).then(r => r.json()).then(d => {
-        console.log(type + ':', d);
+        log('info', `/record ${type} response`, d);
         recording = !recording;
         if (recording) {
             btn.className = 'btn-danger-custom btn-sm';
@@ -368,7 +566,7 @@ function toggleRecord() {
             btn.innerHTML = '<i class="bi bi-record-circle"></i> 开始录制';
             document.getElementById('btnDownload').disabled = false;
         }
-    });
+    }).catch(e => log('error', '/record failed', e.message));
 }
 function downloadRecord() {
     if (!sessionid) return;
@@ -383,9 +581,12 @@ function setAudiotype() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ audiotype: val, sessionid: String(sessionid) }),
-    }).then(r => r.json()).then(d => console.log('set_audiotype:', d));
+    }).then(r => r.json()).then(d => log('info', '/set_audiotype response', d))
+      .catch(e => log('error', '/set_audiotype failed', e.message));
 }
 
+// 初始化
+loadConfig();
 </script>
 </body>
 </html>

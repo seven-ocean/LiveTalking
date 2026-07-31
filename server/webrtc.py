@@ -241,12 +241,39 @@ class HumanPlayer:
         if not self.__started and self.__thread is not None:
             self.__log_debug("Stopping worker thread")
             self.__thread_quit.set()
-            self.__thread.join()
+            # 捕获线程引用，避免 _finalize_cleanup 中 self.__thread 被提前置空后无法 join
+            worker_thread = self.__thread
             self.__thread = None
 
+            # 先在当前线程尝试快速 join（最多 200ms），若失败则放到守护线程异步清理，
+            # 避免阻塞 asyncio 事件循环（PlayerStreamTrack.stop 可能在事件循环线程被调用）。
+            worker_thread.join(timeout=0.2)
+            if worker_thread.is_alive():
+                mylogger.warning(
+                    "HumanPlayer worker thread did not stop within 200ms, continuing cleanup async"
+                )
+                cleanup_thread = threading.Thread(
+                    target=self._finalize_cleanup,
+                    args=(worker_thread, self.__thread_quit),
+                    daemon=True,
+                )
+                cleanup_thread.start()
+
         if not self.__started and self.__container is not None:
-            #self.__container.close()
+            # 不再强 close container，避免二次阻塞；依赖上层 session_manager.stop_session
             self.__container = None
+
+    def _finalize_cleanup(self, worker_thread: threading.Thread, quit_event: threading.Event) -> None:
+        """在守护线程中完成 HumanPlayer worker thread 的收尾清理。"""
+        if worker_thread is not None and worker_thread.is_alive():
+            worker_thread.join(timeout=10.0)
+            if worker_thread.is_alive():
+                mylogger.warning(
+                    "HumanPlayer worker thread still alive after 10s async cleanup"
+                )
+        if quit_event is not None:
+            # 确保 quit_event 保持 set 状态，便于 render 循环识别
+            quit_event.set()
 
     def __log_debug(self, msg: str, *args) -> None:
         mylogger.debug(f"HumanPlayer {msg}", *args)

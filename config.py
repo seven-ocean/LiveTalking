@@ -76,6 +76,35 @@ def parse_args():
     parser.add_argument('--listenport', type=int, default=8010,
                         help="web listen port")
 
+    # ─── WebRTC / ICE / TURN ───────────────────────────────────────────
+    parser.add_argument(
+        '--ice_servers',
+        type=str,
+        default='[{"urls": "stun:stun.freeswitch.org:3478"}]',
+        help="JSON 格式的 ICE 服务器列表，可包含 STUN/TURN，例如 "
+             '[{"urls":"stun:stun.example.com:3478"},'
+             '{"urls":"turn:turn.example.com:3478","username":"u","credential":"p"}]',
+    )
+    parser.add_argument(
+        '--offer_timeout',
+        type=float,
+        default=10.0,
+        help="服务端处理 /offer 的最大超时时间（秒），默认 10",
+    )
+    parser.add_argument(
+        '--ice_gathering_timeout',
+        type=float,
+        default=5.0,
+        help="客户端 ICE 收集超时时间（秒），默认 5。超时后将使用已收集的候选发送 offer",
+    )
+    parser.add_argument(
+        '--webrtc_log_level',
+        type=str,
+        default='DEBUG',
+        choices=['DEBUG', 'INFO', 'WARNING', 'WARN', 'ERROR', 'CRITICAL'],
+        help="WebRTC 专用日志级别，默认 DEBUG",
+    )
+
     opt = parser.parse_args()
 
     # ─── 后处理 ────────────────────────────────────────────────────────
@@ -83,6 +112,19 @@ def parse_args():
     if opt.customvideo_config:
         with open(opt.customvideo_config, 'r') as f:
             opt.customopt = json.load(f)
+
+    # 解析 ICE 服务器 JSON
+    try:
+        opt.ice_servers = json.loads(opt.ice_servers)
+        if not isinstance(opt.ice_servers, list):
+            raise ValueError('ice_servers must be a JSON list')
+    except Exception as e:
+        print(f"[WARN] 解析 --ice_servers 失败 ({e})，使用默认 STUN 服务器")
+        opt.ice_servers = [{"urls": "stun:stun.freeswitch.org:3478"}]
+
+    # 应用 WebRTC 日志级别
+    from utils.logger import set_webrtc_log_level
+    set_webrtc_log_level(opt.webrtc_log_level)
 
     return opt
 

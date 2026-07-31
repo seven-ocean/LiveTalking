@@ -222,6 +222,42 @@ def log_resource_usage():
         )
 
 
+def log_resource_snapshot(label: str = 'snapshot', sessionid: str = None):
+    """打印一行包含 GPU/CPU/RAM 的资源快照，便于与具体事件（如 offer）关联。
+
+    Args:
+        label: 快照标签，例如 'before_offer' / 'after_answer'。
+        sessionid: 可选会话 ID，会附加在日志中。
+    """
+    parts = [f"[resource][{label}]"]
+    if sessionid:
+        parts.append(f"sessionid={sessionid}")
+
+    gpu_mem = get_gpu_memory()
+    if gpu_mem:
+        gpu_util = get_gpu_utilization()
+        util_str = f"{gpu_util['gpu_util_pct']}%" if gpu_util else "?"
+        parts.append(
+            f"GPU={gpu_mem['used_mb']:.0f}/{gpu_mem['total_mb']:.0f}MB "
+            f"({gpu_mem['used_pct']:.1f}%) util={util_str}"
+        )
+    else:
+        parts.append("GPU=unavailable")
+
+    ram = get_memory()
+    if ram:
+        cpu = get_cpu_load()
+        cpu_str = f"{cpu.get('cpu_usage_pct', '?')}%" if cpu and 'cpu_usage_pct' in cpu else "?"
+        parts.append(
+            f"RAM={ram['used_mb']:.0f}/{ram['total_mb']:.0f}MB "
+            f"({ram['used_pct']:.1f}%) CPU={cpu_str}"
+        )
+    else:
+        parts.append("RAM=unavailable")
+
+    logger.info(" ".join(parts))
+
+
 def start_monitoring(interval=60):
     """启动后台监控线程，每隔 interval 秒打印一次资源占用"""
     def _loop():

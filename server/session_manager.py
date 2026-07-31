@@ -50,30 +50,47 @@ class SessionManager:
         """
         if self.build_session_fn is None:
             raise Exception("SessionManager builder not initialized")
-            
+
         if sessionid is None:
             sessionid = _rand_session_id()
-            
+
         logger.info('Creating sessionid=%s, current session num=%d', sessionid, len(self.sessions))
         # 预先占位防止重复
         self.sessions[sessionid] = None
 
-        # 在线程池中构建 session（加载模型非常耗时）
-        avatar_session = await asyncio.get_event_loop().run_in_executor(
-            None, self.build_session_fn, sessionid, params
-        )
-        self.sessions[sessionid] = avatar_session
-        return sessionid
+        try:
+            # 在线程池中构建 session（加载模型非常耗时）
+            avatar_session = await asyncio.get_event_loop().run_in_executor(
+                None, self.build_session_fn, sessionid, params
+            )
+            self.sessions[sessionid] = avatar_session
+            return sessionid
+        except Exception:
+            # 构建失败时清理占位，避免留下 None 导致后续访问异常
+            logger.exception('Failed to create session %s', sessionid)
+            self.sessions.pop(sessionid, None)
+            raise
         
     def add_session(self, sessionid: str, avatar_session: BaseAvatar):
         """同步添加静态或外部管理的会话（供非服务端入口调用）"""
         self.sessions[sessionid] = avatar_session
         
+    def stop_session(self, sessionid: str):
+        """显式停止会话资源，但不删除引用"""
+        avatar_session = self.sessions.get(sessionid)
+        if avatar_session is None:
+            return
+        logger.info(f"Stopping session {sessionid}")
+        if hasattr(avatar_session, 'request_stop'):
+            avatar_session.request_stop()
+        elif hasattr(avatar_session, 'quit_event'):
+            avatar_session.quit_event.set()
+
     def remove_session(self, sessionid: str):
         """销毁会话资源"""
+        self.stop_session(sessionid)
         if sessionid in self.sessions:
             logger.info(f"Removing session {sessionid}")
-            # todo: 还可以主动调 avatar_session 释放
             self.sessions.pop(sessionid, None)
 
 # 单例抛出

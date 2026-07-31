@@ -509,7 +509,8 @@ class BaseAvatar:
         self.init_customindex()
         self.tts.render(quit_event)
 
-        infer_quit_event = mp.Event()
+        # 注意：infer_thread 是普通 Thread，应使用 threading.Event，而非 mp.Event
+        infer_quit_event = Event()
         infer_thread = Thread(target=self.inference, args=(infer_quit_event,))
         infer_thread.start()
         
@@ -521,19 +522,31 @@ class BaseAvatar:
         totaltime=0
         _starttime=time.perf_counter()
         _totalframe=0
-        while not quit_event.is_set(): 
+        while not quit_event.is_set():
             t = time.perf_counter()
             self.asr.run_step()
+            if quit_event.is_set():
+                break
 
             buffer_size = self.output.get_buffer_size() if hasattr(self.output, 'get_buffer_size') else 0
             if buffer_size >= 5:
                 logger.debug('sleep qsize=%d', buffer_size)
-                time.sleep(0.04 * buffer_size * 0.8)
+                # 将长 sleep 拆分为短步，便于快速响应 quit_event
+                sleep_total = 0.04 * buffer_size * 0.8
+                sleep_step = 0.05
+                slept = 0.0
+                while slept < sleep_total and not quit_event.is_set():
+                    time.sleep(min(sleep_step, sleep_total - slept))
+                    slept += sleep_step
         logger.info('baseavatar render thread stop')
 
         infer_quit_event.set()
-        infer_thread.join()
+        infer_thread.join(timeout=3.0)
+        if infer_thread.is_alive():
+            logger.warning("inference thread did not stop within 3s")
 
         process_quit_event.set()
-        process_thread.join()
+        process_thread.join(timeout=3.0)
+        if process_thread.is_alive():
+            logger.warning("process_frames thread did not stop within 3s")
 
