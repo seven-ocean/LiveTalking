@@ -105,6 +105,14 @@ def build_avatar_session(sessionid:str, params:dict)->BaseAvatar:
 async def offer(request):
     return await rtc_manager.handle_offer(request)
 
+async def warmup_avatar(request):
+    """预热 avatar：前端切换形象前调用，避免首次 /offer 因冷加载超时。"""
+    params = await request.json()
+    avatar_id = params.get('avatar')
+    if avatar_id and avatar_id not in global_avatars:
+        global_avatars[avatar_id] = load_avatar(avatar_id)
+    return web.Response(content_type="application/json", text=json.dumps({"code": 0}))
+
 async def on_shutdown(app):
     await rtc_manager.shutdown()
 
@@ -206,6 +214,7 @@ def main():
     appasync.on_shutdown.append(on_shutdown)
     appasync.router.add_post("/offer", offer)
     appasync.router.add_get("/record/{sessionid}", download_record)
+    appasync.router.add_post("/warmup", warmup_avatar)
     
     # 注册 server/routes.py 中的通用 API 路由
     setup_routes(appasync) 

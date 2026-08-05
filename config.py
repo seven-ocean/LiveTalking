@@ -88,8 +88,8 @@ def parse_args():
     parser.add_argument(
         '--offer_timeout',
         type=float,
-        default=10.0,
-        help="服务端处理 /offer 的最大超时时间（秒），默认 10",
+        default=30.0,
+        help="服务端处理 /offer 的最大超时时间（秒），默认 30",
     )
     parser.add_argument(
         '--ice_gathering_timeout',
