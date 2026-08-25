@@ -105,6 +105,17 @@ def parse_args():
         help="WebRTC 专用日志级别，默认 DEBUG",
     )
 
+    # ─── 授权加固（批次 4）─────────────────────────────────────────────
+    parser.add_argument('--ZL_AI_SERVER', type=str,
+                        default=os.getenv('ZL_AI_SERVER', 'http://127.0.0.1:9306'),
+                        help="zl-ai 主包地址（启动授权校验接口 /aihuman/license/status）")
+    parser.add_argument('--license_check', type=str_to_bool,
+                        default=str_to_bool(os.getenv('ZL_LICENSE_CHECK', 'False')),
+                        help="启动时校验 zl-ai 授权（True/False），默认 False")
+    parser.add_argument('--license_check_timeout', type=float,
+                        default=float(os.getenv('ZL_LICENSE_CHECK_TIMEOUT', '5')),
+                        help="启动授权校验单次请求超时（秒），默认 5")
+
     opt = parser.parse_args()
 
     # ─── 后处理 ────────────────────────────────────────────────────────

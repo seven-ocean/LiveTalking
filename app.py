@@ -152,6 +152,11 @@ def main():
     warm_up = avatar_mod.warm_up
     logger.info(opt)
 
+    # ─── 启动授权校验（license_check，默认关闭）────────────────────
+    # 开启后向 zl-ai 主包 /aihuman/license/status 校验授权，失败则拒绝启动
+    from license_check import run_license_check
+    run_license_check(opt)
+
     # 自动设置默认 ONNX 路径
     if opt.use_onnx and not opt.onnx_model_path:
         if opt.model == 'musetalk':
@@ -217,7 +222,12 @@ def main():
     appasync.router.add_post("/warmup", warmup_avatar)
     
     # 注册 server/routes.py 中的通用 API 路由
-    setup_routes(appasync) 
+    setup_routes(appasync)
+
+    # ─── 入站鉴权（X-Api-Key，ZL_API_KEY 未配置时放行）────────────
+    # 需注册在 aiohttp_cors.setup 之前，保证预检 OPTIONS 先放行
+    from server.auth import make_auth_middleware
+    appasync.middlewares.append(make_auth_middleware())
 
     # Configure default CORS settings.
     cors = aiohttp_cors.setup(appasync, defaults={

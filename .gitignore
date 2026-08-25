@@ -19,6 +19,11 @@ workspace/log_ngp.txt
 models/
 *.log
 dist
+dist-talking/
+
+# PyArmor 加密构建临时工具/配置目录
+.pyarmor-tools/
+.pyarmor-home/
 
 ffmpeg/
 README.txt
