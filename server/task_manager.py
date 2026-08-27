@@ -113,6 +113,33 @@ class TaskManager:
             else:
                 raise ValueError(f"Unsupported model type: {task.model_type}")
 
+            # ── 动作编排：基座生成完成后，按标记片段生成形象动作 + 元信息 ──
+            actions_param = task.params.get('actions')
+            if isinstance(actions_param, str):
+                actions_param = json.loads(actions_param)
+            avatar_name = task.params.get('name')
+
+            if actions_param:
+                from server.action_builder import build_avatar_actions
+                def actions_progress(p):
+                    task.progress = p
+                build_avatar_actions(
+                    avatar_id=task.avatar_id,
+                    video_path=task.params['video_path'],
+                    actions=actions_param,
+                    save_path=task.params.get('save_path', './data/avatars'),
+                    progress_callback=actions_progress
+                )
+
+            if avatar_name is not None:
+                from server.action_builder import build_avatar_meta
+                build_avatar_meta(
+                    avatar_id=task.avatar_id,
+                    name=avatar_name,
+                    model=task.model_type,
+                    actions=actions_param or {}
+                )
+
             task.status = "completed"
             task.progress = 100
             self._notify(task)

@@ -1,0 +1,716 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>形象创建操作台 - LiveTalking</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
+    <style>
+        :root {
+            --primary-gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            --glass-bg: rgba(255, 255, 255, 0.9);
+            --card-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.15);
+        }
+        body {
+            background: #f0f2f5;
+            background-image: radial-gradient(#d1d1d1 1px, transparent 1px);
+            background-size: 20px 20px;
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            color: #2d3436;
+            min-height: 100vh;
+            padding-bottom: 50px;
+        }
+        .navbar { background: var(--primary-gradient); box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        .container { max-width: 1200px; margin-top: 30px; }
+        .glass-card {
+            background: var(--glass-bg);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            border-radius: 15px;
+            border: 1px solid rgba(255, 255, 255, 0.18);
+            box-shadow: var(--card-shadow);
+            margin-bottom: 25px;
+        }
+        .card-header {
+            background: transparent;
+            border-bottom: 1px solid rgba(0,0,0,0.05);
+            padding: 16px 20px;
+            font-weight: 700;
+            font-size: 1.1rem;
+            display: flex;
+            align-items: center;
+        }
+        .card-header i { margin-right: 10px; color: #667eea; }
+        .card-body { padding: 20px; }
+        .btn-submit {
+            background: var(--primary-gradient);
+            border: none;
+            color: white;
+            padding: 12px;
+            font-weight: 600;
+            border-radius: 10px;
+            transition: transform 0.2s;
+        }
+        .btn-submit:hover { transform: translateY(-2px); box-shadow: 0 5px 15px rgba(118, 75, 162, 0.4); color: white; }
+        .param-group { background: #f8f9fa; padding: 15px; border-radius: 10px; margin-top: 15px; }
+        .action-card { border: 1px solid #e9ecef; border-radius: 12px; padding: 14px; margin-bottom: 12px; background: #fbfcfe; }
+        .action-card .action-title { font-weight: 700; margin-bottom: 10px; }
+        .action-card .action-title .badge { font-weight: 500; }
+        .mark-btn { min-width: 88px; }
+        .avatar-item { border-bottom: 1px solid #eee; padding: 14px 0; }
+        .avatar-item:last-child { border-bottom: none; }
+        .progress { height: 10px; border-radius: 5px; margin-top: 10px; }
+        .badge-status { font-size: 0.8rem; padding: 5px 10px; border-radius: 20px; }
+        .status-pending { background: #ffeaa7; color: #d63031; }
+        .status-running { background: #81ecec; color: #00cec9; }
+        .status-completed { background: #55efc4; color: #00b894; }
+        .status-failed { background: #ff7675; color: #d63031; }
+        .video-preview { width: 100%; border-radius: 10px; background: #000; }
+        .time-label { font-size: 0.85rem; color: #636e72; }
+        #taskProgressArea { display: none; }
+        .invalid-input { border-color: #dc3545 !important; }
+        .hint-text { font-size: 0.8rem; color: #b2bec3; }
+    </style>
+</head>
+<body>
+
+<nav class="navbar navbar-dark mb-4">
+    <div class="container-fluid px-4">
+        <a class="navbar-brand" href="#">
+            <i class="bi bi-person-bounding-box me-2"></i>
+            LiveTalking 形象创建操作台
+        </a>
+        <div class="d-flex">
+            <a class="btn btn-outline-light btn-sm me-2" href="/avatar.html" target="_blank">
+                <i class="bi bi-sliders"></i> 简易生成页
+            </a>
+            <a class="btn btn-outline-light btn-sm" href="/" target="_blank">
+                <i class="bi bi-play-circle"></i> 演示页
+            </a>
+        </div>
+    </div>
+</nav>
+
+<div class="container">
+    <div class="row">
+        <!-- 左侧：创建/编辑表单 -->
+        <div class="col-lg-6">
+            <!-- 区段 1：形象信息 -->
+            <div class="glass-card">
+                <div class="card-header">
+                    <i class="bi bi-person-vcard-fill"></i> 1. 形象信息
+                </div>
+                <div class="card-body">
+                    <form id="avatarInfoForm">
+                        <div class="row">
+                            <div class="col-6 mb-3">
+                                <label class="form-label">形象 ID（唯一标识）</label>
+                                <input type="text" class="form-control" id="avatarIdInput" placeholder="如: avatar_zhangsan" required>
+                            </div>
+                            <div class="col-6 mb-3">
+                                <label class="form-label">形象名称（便于识别）</label>
+                                <input type="text" class="form-control" id="avatarNameInput" placeholder="如: 张三" required>
+                            </div>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label">算法模型</label>
+                            <select class="form-select" id="modelSelect">
+                                <option value="wav2lip">Wav2Lip</option>
+                                <option value="musetalk">MuseTalk</option>
+                            </select>
+                        </div>
+                        <div class="mb-3">
+                            <a class="text-decoration-none" data-bs-toggle="collapse" href="#advancedParams" role="button">
+                                <i class="bi bi-gear me-1"></i> 高级参数 (可选)
+                            </a>
+                            <div class="collapse mt-2" id="advancedParams">
+                                <div class="param-group">
+                                    <div class="row">
+                                        <div class="col-6 mb-2">
+                                            <label class="form-label small">图像大小</label>
+                                            <input type="number" class="form-control form-control-sm" id="imgSizeInput" value="256">
+                                        </div>
+                                        <div class="col-6 mb-2">
+                                            <label class="form-label small">BBox Shift (musetalk)</label>
+                                            <input type="number" class="form-control form-control-sm" id="bboxShiftInput" value="0">
+                                        </div>
+                                    </div>
+                                    <div class="row">
+                                        <div class="col-6 mb-2">
+                                            <label class="form-label small">Pads (上下左右)</label>
+                                            <input type="text" class="form-control form-control-sm" id="padsInput" value="0 10 0 0" placeholder="0 10 0 0">
+                                        </div>
+                                        <div class="col-6 mb-2">
+                                            <label class="form-label small">人脸检测批大小</label>
+                                            <input type="number" class="form-control form-control-sm" id="faceDetBatchInput" value="4">
+                                        </div>
+                                    </div>
+                                    <div class="row">
+                                        <div class="col-6 mb-2">
+                                            <label class="form-label small">Extra Margin (musetalk)</label>
+                                            <input type="number" class="form-control form-control-sm" id="extraMarginInput" value="10">
+                                        </div>
+                                        <div class="col-6 mb-2">
+                                            <label class="form-label small">Parsing Mode (musetalk)</label>
+                                            <select class="form-select form-select-sm" id="parsingModeInput">
+                                                <option value="jaw">jaw</option>
+                                                <option value="both">both</option>
+                                            </select>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </form>
+                </div>
+            </div>
+
+            <!-- 区段 2：视频导入与预览 -->
+            <div class="glass-card">
+                <div class="card-header">
+                    <i class="bi bi-film"></i> 2. 视频导入与预览
+                </div>
+                <div class="card-body">
+                    <div class="mb-2">
+                        <input type="file" class="form-control" id="videoFileInput" accept="video/*">
+                    </div>
+                    <video id="videoPlayer" class="video-preview" controls></video>
+                    <div class="d-flex justify-content-between mt-2 time-label">
+                        <span>当前时间：<b id="currentTimeLabel">00:00.0</b></span>
+                        <span>总时长：<b id="durationLabel">--:--</b></span>
+                    </div>
+                    <div class="hint-text mt-2">
+                        提示：先播放视频找到关键位置，用下方「标记起点/终点」快速打点，也可直接手动输入秒数（支持小数）。
+                    </div>
+                </div>
+            </div>
+
+            <!-- 区段 3：动作片段标记 -->
+            <div class="glass-card">
+                <div class="card-header">
+                    <i class="bi bi-scissors"></i> 3. 动作片段标记
+                </div>
+                <div class="card-body" id="actionMarkerArea">
+                    <div class="action-card" data-action="idle">
+                        <div class="action-title">
+                            <span class="me-2">待机动作</span>
+                            <span class="badge text-bg-secondary status-badge">未设置</span>
+                            <span class="hint-text ms-2">（仅提取画面，TTS 静默时自动循环）</span>
+                        </div>
+                        <div class="row g-2">
+                            <div class="col-5">
+                                <div class="input-group input-group-sm">
+                                    <span class="input-group-text">起点</span>
+                                    <input type="number" step="0.1" min="0" class="form-control seg-start" placeholder="秒">
+                                </div>
+                            </div>
+                            <div class="col-5">
+                                <div class="input-group input-group-sm">
+                                    <span class="input-group-text">终点</span>
+                                    <input type="number" step="0.1" min="0" class="form-control seg-end" placeholder="秒">
+                                </div>
+                            </div>
+                            <div class="col-2 d-flex align-items-center">
+                                <span class="hint-text">播放到目标位置点按钮打点</span>
+                            </div>
+                            <div class="col-4">
+                                <button class="btn btn-sm btn-outline-secondary w-100 mark-start" type="button">标记起点</button>
+                            </div>
+                            <div class="col-4">
+                                <button class="btn btn-sm btn-outline-secondary w-100 mark-end" type="button">标记终点</button>
+                            </div>
+                            <div class="col-4">
+                                <button class="btn btn-sm btn-outline-primary w-100 seg-preview" type="button">试播片段</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="action-card" data-action="reply">
+                        <div class="action-title">
+                            <span class="me-2">讲解动作</span>
+                            <span class="badge text-bg-secondary status-badge">未设置</span>
+                            <span class="hint-text ms-2">（画面 + 音频，讲解时播放）</span>
+                        </div>
+                        <div class="row g-2">
+                            <div class="col-5">
+                                <div class="input-group input-group-sm">
+                                    <span class="input-group-text">起点</span>
+                                    <input type="number" step="0.1" min="0" class="form-control seg-start" placeholder="秒">
+                                </div>
+                            </div>
+                            <div class="col-5">
+                                <div class="input-group input-group-sm">
+                                    <span class="input-group-text">终点</span>
+                                    <input type="number" step="0.1" min="0" class="form-control seg-end" placeholder="秒">
+                                </div>
+                            </div>
+                            <div class="col-2 d-flex align-items-center">
+                                <span class="hint-text">播放到目标位置点按钮打点</span>
+                            </div>
+                            <div class="col-4">
+                                <button class="btn btn-sm btn-outline-secondary w-100 mark-start" type="button">标记起点</button>
+                            </div>
+                            <div class="col-4">
+                                <button class="btn btn-sm btn-outline-secondary w-100 mark-end" type="button">标记终点</button>
+                            </div>
+                            <div class="col-4">
+                                <button class="btn btn-sm btn-outline-primary w-100 seg-preview" type="button">试播片段</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="action-card" data-action="think">
+                        <div class="action-title">
+                            <span class="me-2">思考动作</span>
+                            <span class="badge text-bg-secondary status-badge">未设置</span>
+                            <span class="hint-text ms-2">（画面 + 音频，思考时播放）</span>
+                        </div>
+                        <div class="row g-2">
+                            <div class="col-5">
+                                <div class="input-group input-group-sm">
+                                    <span class="input-group-text">起点</span>
+                                    <input type="number" step="0.1" min="0" class="form-control seg-start" placeholder="秒">
+                                </div>
+                            </div>
+                            <div class="col-5">
+                                <div class="input-group input-group-sm">
+                                    <span class="input-group-text">终点</span>
+                                    <input type="number" step="0.1" min="0" class="form-control seg-end" placeholder="秒">
+                                </div>
+                            </div>
+                            <div class="col-2 d-flex align-items-center">
+                                <span class="hint-text">播放到目标位置点按钮打点</span>
+                            </div>
+                            <div class="col-4">
+                                <button class="btn btn-sm btn-outline-secondary w-100 mark-start" type="button">标记起点</button>
+                            </div>
+                            <div class="col-4">
+                                <button class="btn btn-sm btn-outline-secondary w-100 mark-end" type="button">标记终点</button>
+                            </div>
+                            <div class="col-4">
+                                <button class="btn btn-sm btn-outline-primary w-100 seg-preview" type="button">试播片段</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 区段 4：提交 -->
+            <div class="glass-card">
+                <div class="card-header">
+                    <i class="bi bi-cloud-arrow-up-fill"></i> 4. 提交创建 / 更新
+                </div>
+                <div class="card-body">
+                    <button type="button" class="btn btn-submit w-100" id="submitBtn">
+                        <i class="bi bi-magic me-2"></i>创建形象
+                    </button>
+                    <div id="taskProgressArea" class="mt-3">
+                        <div class="d-flex justify-content-between small mb-1">
+                            <span id="taskStatusText" class="text-muted">任务处理中...</span>
+                            <span id="taskProgressText">0%</span>
+                        </div>
+                        <div class="progress">
+                            <div class="progress-bar progress-bar-striped progress-bar-animated" id="taskProgressBar"
+                                 role="progressbar" style="width: 0%">0%</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- 右侧：已创建形象列表 -->
+        <div class="col-lg-6">
+            <div class="glass-card">
+                <div class="card-header">
+                    <i class="bi bi-person-lines-fill"></i> 已创建形象
+                    <span class="ms-auto">
+                        <button class="btn btn-sm btn-outline-secondary" id="refreshAvatarsBtn">
+                            <i class="bi bi-arrow-repeat"></i> 刷新
+                        </button>
+                    </span>
+                </div>
+                <div class="card-body" id="avatarList" style="max-height: 700px; overflow-y: auto;">
+                    <div class="text-center py-5 text-muted">
+                        <div class="spinner-border spinner-border-sm me-2"></div>正在加载形象列表...
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+    // ── 状态 ──────────────────────────────────────────────
+    const videoPlayer = document.getElementById('videoPlayer');
+    const videoFileInput = document.getElementById('videoFileInput');
+    let videoObjectUrl = null;
+    let videoDuration = 0;
+    let editingAvatarId = null;   // 非空 = 编辑模式（更新动作）
+    let pollingTimer = null;
+
+    // 动作定义：idle=待机(仅画面) / reply=讲解(画面+音频) / think=思考(画面+音频)
+    const ACTION_NAMES = { idle: '待机', reply: '讲解', think: '思考' };
+    const ACTION_KEYS = ['idle', 'reply', 'think'];
+
+    // ── 工具函数 ──────────────────────────────────────────
+    function fmtTime(sec) {
+        if (sec == null || isNaN(sec)) return '00:00.0';
+        const m = Math.floor(sec / 60);
+        const s = sec - m * 60;
+        return String(m).padStart(2, '0') + ':' + s.toFixed(1).padStart(4, '0');
+    }
+
+    function getSeg(actionKey) {
+        const card = document.querySelector(`.action-card[data-action="${actionKey}"]`);
+        const start = parseFloat(card.querySelector('.seg-start').value);
+        const end = parseFloat(card.querySelector('.seg-end').value);
+        return { card, start, end };
+    }
+
+    function validateSeg(actionKey, duration) {
+        const { card, start, end } = getSeg(actionKey);
+        const startEl = card.querySelector('.seg-start');
+        const endEl = card.querySelector('.seg-end');
+        startEl.classList.remove('invalid-input');
+        endEl.classList.remove('invalid-input');
+        if (isNaN(start) && isNaN(end)) return null;   // 未标记
+        if (isNaN(start) || isNaN(end)) {
+            if (isNaN(start)) startEl.classList.add('invalid-input');
+            if (isNaN(end)) endEl.classList.add('invalid-input');
+            return { error: `${ACTION_NAMES[actionKey]}：起点和终点都要填写` };
+        }
+        if (start < 0) {
+            startEl.classList.add('invalid-input');
+            return { error: `${ACTION_NAMES[actionKey]}：起点不能为负` };
+        }
+        if (end <= start) {
+            endEl.classList.add('invalid-input');
+            return { error: `${ACTION_NAMES[actionKey]}：终点必须大于起点` };
+        }
+        if (duration && end > duration) {
+            endEl.classList.add('invalid-input');
+            return { error: `${ACTION_NAMES[actionKey]}：终点 ${end.toFixed(1)}s 超出视频时长 ${duration.toFixed(1)}s` };
+        }
+        return { start, end };
+    }
+
+    function collectActions() {
+        const actions = {};
+        let firstError = null;
+        ACTION_KEYS.forEach(key => {
+            const r = validateSeg(key, videoDuration);
+            if (r === null) return;
+            if (r.error) {
+                if (!firstError) firstError = r.error;
+                return;
+            }
+            actions[key] = { start: r.start, end: r.end };
+        });
+        if (firstError) return { error: firstError };
+        return { actions };
+    }
+
+    function refreshBadges() {
+        ACTION_KEYS.forEach(key => {
+            const r = validateSeg(key, videoDuration);
+            const card = document.querySelector(`.action-card[data-action="${key}"]`);
+            const badge = card.querySelector('.status-badge');
+            if (r && !r.error) {
+                badge.className = 'badge status-badge text-bg-success';
+                badge.textContent = `已设置 ${r.start.toFixed(1)} ~ ${r.end.toFixed(1)} 秒`;
+            } else {
+                badge.className = 'badge status-badge text-bg-secondary';
+                badge.textContent = '未设置';
+            }
+        });
+    }
+
+    function fillSegments(actions) {
+        (actions || {}).forEach(item => {
+            const key = Object.keys(ACTION_NAMES).find(k => {
+                // 依据 audiotype 映射回动作名：idle=1 reply=2 think=3
+                return (k === 'idle' && item.audiotype === 1) ||
+                       (k === 'reply' && item.audiotype === 2) ||
+                       (k === 'think' && item.audiotype === 3);
+            });
+            if (!key) return;
+            // 动作片段时间无法从 actions.json 直接读出（只有生成结果），编辑时提示用户重新标记
+            const card = document.querySelector(`.action-card[data-action="${key}"]`);
+            const badge = card.querySelector('.status-badge');
+            badge.className = 'badge status-badge text-bg-warning';
+            badge.textContent = '已存在，请重新标记或保留';
+        });
+    }
+
+    // ── 视频导入与预览 ────────────────────────────────────
+    videoFileInput.addEventListener('change', () => {
+        const file = videoFileInput.files[0];
+        if (!file) return;
+        if (videoObjectUrl) URL.revokeObjectURL(videoObjectUrl);
+        videoObjectUrl = URL.createObjectURL(file);
+        videoPlayer.src = videoObjectUrl;
+        videoPlayer.load();
+        refreshBadges();
+    });
+
+    videoPlayer.addEventListener('loadedmetadata', () => {
+        videoDuration = videoPlayer.duration || 0;
+        document.getElementById('durationLabel').textContent = fmtTime(videoDuration);
+        refreshBadges();
+    });
+
+    videoPlayer.addEventListener('timeupdate', () => {
+        document.getElementById('currentTimeLabel').textContent = fmtTime(videoPlayer.currentTime);
+        // 试播到终点自动暂停
+        const activeKey = videoPlayer.dataset.previewAction;
+        if (activeKey) {
+            const { end } = getSeg(activeKey);
+            if (!isNaN(end) && videoPlayer.currentTime >= end) {
+                videoPlayer.pause();
+                videoPlayer.dataset.previewAction = '';
+            }
+        }
+    });
+
+    // ── 片段标记工具 ──────────────────────────────────────
+    document.getElementById('actionMarkerArea').addEventListener('click', (e) => {
+        const card = e.target.closest('.action-card');
+        if (!card) return;
+        const actionKey = card.dataset.action;
+        const startEl = card.querySelector('.seg-start');
+        const endEl = card.querySelector('.seg-end');
+
+        if (e.target.closest('.mark-start')) {
+            startEl.value = videoPlayer.currentTime.toFixed(2);
+            refreshBadges();
+        } else if (e.target.closest('.mark-end')) {
+            endEl.value = videoPlayer.currentTime.toFixed(2);
+            refreshBadges();
+        } else if (e.target.closest('.seg-preview')) {
+            const { start, end } = getSeg(actionKey);
+            if (isNaN(start) || isNaN(end) || end <= start) {
+                alert(`${ACTION_NAMES[actionKey]}：请先设置合法的起点和终点`);
+                return;
+            }
+            videoPlayer.dataset.previewAction = actionKey;
+            videoPlayer.currentTime = start;
+            videoPlayer.play();
+        }
+    });
+
+    document.querySelectorAll('.seg-start, .seg-end').forEach(el => {
+        el.addEventListener('input', refreshBadges);
+    });
+
+    // ── 提交 ──────────────────────────────────────────────
+    document.getElementById('submitBtn').addEventListener('click', async () => {
+        const avatarId = document.getElementById('avatarIdInput').value.trim();
+        const name = document.getElementById('avatarNameInput').value.trim();
+        const model = document.getElementById('modelSelect').value;
+        const file = videoFileInput.files[0];
+
+        if (!avatarId) { alert('请填写形象 ID'); return; }
+        if (!name) { alert('请填写形象名称'); return; }
+        if (!file) { alert('请上传主视频'); return; }
+
+        const collected = collectActions();
+        if (collected.error) { alert(collected.error); return; }
+        if (Object.keys(collected.actions).length === 0) {
+            if (!confirm('未标记任何动作片段，仅创建形象基底（后续可在页面重新标记）。继续？')) return;
+        }
+
+        const formData = new FormData();
+        formData.append('model', model);
+        formData.append('avatar_id', avatarId);
+        formData.append('name', name);
+        formData.append('video_file', file);
+        formData.append('actions', JSON.stringify(collected.actions));
+        // 高级参数
+        formData.append('img_size', document.getElementById('imgSizeInput').value);
+        formData.append('bbox_shift', document.getElementById('bboxShiftInput').value);
+        formData.append('pads', document.getElementById('padsInput').value);
+        formData.append('face_det_batch_size', document.getElementById('faceDetBatchInput').value);
+        formData.append('extra_margin', document.getElementById('extraMarginInput').value);
+        formData.append('parsing_mode', document.getElementById('parsingModeInput').value);
+
+        const endpoint = editingAvatarId
+            ? '/api/avatar/actions'
+            : '/api/avatar/task';
+
+        const submitBtn = document.getElementById('submitBtn');
+        submitBtn.disabled = true;
+        submitBtn.innerHTML = '<span class="spinner-border spinner-border-sm me-2"></span>上传中...';
+
+        try {
+            const resp = await fetch(endpoint, { method: 'POST', body: formData });
+            const result = await resp.json();
+            if (result.code !== 0) { alert('提交失败: ' + result.msg); return; }
+
+            if (editingAvatarId) {
+                alert('动作更新成功！');
+                exitEditMode();
+                loadAvatars();
+            } else {
+                // 轮询任务进度
+                startPolling(result.data.task_id);
+            }
+        } catch (err) {
+            console.error(err);
+            alert('提交发生网络错误');
+        } finally {
+            submitBtn.disabled = false;
+            submitBtn.innerHTML = editingAvatarId
+                ? '<i class="bi bi-arrow-repeat me-2"></i>更新动作'
+                : '<i class="bi bi-magic me-2"></i>创建形象';
+        }
+    });
+
+    function startPolling(taskId) {
+        const area = document.getElementById('taskProgressArea');
+        const bar = document.getElementById('taskProgressBar');
+        const text = document.getElementById('taskProgressText');
+        const statusText = document.getElementById('taskStatusText');
+        area.style.display = 'block';
+
+        if (pollingTimer) clearInterval(pollingTimer);
+        pollingTimer = setInterval(async () => {
+            try {
+                const resp = await fetch(`/api/avatar/task/${taskId}`);
+                const result = await resp.json();
+                if (result.code !== 0) { stopPolling(); return; }
+                const t = result.data;
+                bar.style.width = t.progress + '%';
+                bar.textContent = t.progress + '%';
+                text.textContent = t.progress + '%';
+                statusText.textContent = t.status === 'running' || t.status === 'pending'
+                    ? '形象生成中（基座训练较耗时，请耐心等待）...'
+                    : t.status;
+                if (t.status === 'completed') {
+                    stopPolling();
+                    area.style.display = 'none';
+                    alert('形象创建成功！');
+                    loadAvatars();
+                } else if (t.status === 'failed') {
+                    stopPolling();
+                    alert('创建失败: ' + (t.error_msg || '未知错误'));
+                }
+            } catch (err) {
+                stopPolling();
+                console.error(err);
+            }
+        }, 3000);
+    }
+
+    function stopPolling() {
+        if (pollingTimer) { clearInterval(pollingTimer); pollingTimer = null; }
+    }
+
+    // ── 已创建形象列表 ────────────────────────────────────
+    async function loadAvatars() {
+        try {
+            const resp = await fetch('/api/avatar/list');
+            const result = await resp.json();
+            const listEl = document.getElementById('avatarList');
+            if (result.code !== 0) {
+                listEl.innerHTML = '<div class="text-center py-5 text-muted">加载失败</div>';
+                return;
+            }
+            const avatars = result.data.avatars || [];
+            if (avatars.length === 0) {
+                listEl.innerHTML = '<div class="text-center py-5 text-muted">暂无形象，请通过左侧操作台创建</div>';
+                return;
+            }
+            listEl.innerHTML = avatars.map(a => {
+                const actions = a.actions || {};
+                const hasIdle = Array.isArray(actions) ? actions.some(x => x.audiotype === 1) : !!actions.idle;
+                const hasReply = Array.isArray(actions) ? actions.some(x => x.audiotype === 2) : !!actions.reply;
+                const hasThink = Array.isArray(actions) ? actions.some(x => x.audiotype === 3) : !!actions.think;
+                const date = a.created_at ? new Date(a.created_at * 1000).toLocaleString() : '--';
+                return `
+                <div class="avatar-item">
+                    <div class="d-flex justify-content-between align-items-start">
+                        <div>
+                            <div class="fw-bold">
+                                <i class="bi bi-person-bounding-box text-primary me-1"></i>${escapeHtml(a.name || a.avatar_id)}
+                                <span class="badge bg-secondary ms-1">${escapeHtml(a.model || '?')}</span>
+                            </div>
+                            <div class="small text-muted mt-1">
+                                ID: <b>${escapeHtml(a.avatar_id)}</b> · ${date}
+                            </div>
+                            <div class="small mt-1">
+                                <span class="badge ${hasIdle ? 'text-bg-success' : 'text-bg-secondary'}">待机${hasIdle ? '✓' : ''}</span>
+                                <span class="badge ${hasReply ? 'text-bg-success' : 'text-bg-secondary'}">讲解${hasReply ? '✓' : ''}</span>
+                                <span class="badge ${hasThink ? 'text-bg-success' : 'text-bg-secondary'}">思考${hasThink ? '✓' : ''}</span>
+                            </div>
+                        </div>
+                        <div class="text-end">
+                            <button class="btn btn-sm btn-outline-primary" onclick="editAvatar('${escapeAttr(a.avatar_id)}')">
+                                <i class="bi bi-pencil-square"></i> 编辑动作
+                            </button>
+                        </div>
+                    </div>
+                </div>`;
+            }).join('');
+        } catch (err) {
+            console.error('Load avatars failed:', err);
+        }
+    }
+
+    function escapeHtml(s) {
+        return String(s).replace(/[&<>"']/g, c => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[c]));
+    }
+    function escapeAttr(s) { return escapeHtml(s); }
+
+    async function editAvatar(avatarId) {
+        try {
+            const resp = await fetch(`/api/avatar/${encodeURIComponent(avatarId)}`);
+            const result = await resp.json();
+            if (result.code !== 0) { alert('获取形象详情失败: ' + result.msg); return; }
+            const detail = result.data;
+
+            editingAvatarId = avatarId;
+            document.getElementById('avatarIdInput').value = detail.avatar_id;
+            document.getElementById('avatarIdInput').disabled = true;
+            document.getElementById('avatarNameInput').value = detail.name || detail.avatar_id;
+            if (detail.model) document.getElementById('modelSelect').value = detail.model;
+
+            // 回填已存在动作的标记状态（具体时间需重新上传视频后标记）
+            fillSegments(detail.actions);
+
+            // 提示重新上传视频
+            if (videoObjectUrl) { URL.revokeObjectURL(videoObjectUrl); videoObjectUrl = null; }
+            videoPlayer.removeAttribute('src');
+            videoFileInput.value = '';
+            videoDuration = 0;
+            document.getElementById('durationLabel').textContent = '--:--';
+
+            const submitBtn = document.getElementById('submitBtn');
+            submitBtn.innerHTML = '<i class="bi bi-arrow-repeat me-2"></i>更新动作';
+
+            alert(`已进入编辑模式：${detail.name || avatarId}\n请重新上传视频并标记片段后点「更新动作」。\n（未标记的动作将被移除，如需保留请一并标记）`);
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+        } catch (err) {
+            console.error(err);
+            alert('获取形象详情失败');
+        }
+    }
+
+    function exitEditMode() {
+        editingAvatarId = null;
+        document.getElementById('avatarIdInput').disabled = false;
+        const submitBtn = document.getElementById('submitBtn');
+        submitBtn.innerHTML = '<i class="bi bi-magic me-2"></i>创建形象';
+    }
+
+    document.getElementById('refreshAvatarsBtn').addEventListener('click', loadAvatars);
+
+    // 初始加载
+    loadAvatars();
+</script>
+
+</body>
+</html>

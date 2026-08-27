@@ -138,3 +138,75 @@ DELETE /api/avatar/task/{task_id}
 ## 生成输出
 
 Avatar 数据保存在 `<data_path>/<avatar_id>/` 目录下，包含：`full_imgs/`、`face_imgs/`、`coords.pkl` 及模型特定文件。生成完成后可直接通过 `--avatar_id <avatar_id>` 启动服务。
+
+---
+
+## 5. 动作编排（形象创建操作台）
+
+配合操作台页面 `/avatar-studio.html` 使用。创建任务时可通过 `name` / `actions` 参数自动生成形象动作配置。
+
+### actions 参数格式（JSON 字符串）
+
+```json
+{
+  "idle":  { "start": 0,  "end": 3  },
+  "reply": { "start": 4,  "end": 12 },
+  "think": { "start": 13, "end": 16 }
+}
+```
+
+- 动作名固定：`idle`=待机(audiotype 1，仅提取帧序列，TTS 静默自动循环)、`reply`=讲解(audiotype 2，帧+16k mono wav)、`think`=思考(audiotype 3，帧+16k mono wav)；
+- 时间单位为秒，支持小数；`end` 必须大于 `start` 且不超过视频时长；
+- 未标记的动作不生成，运行时回退全局配置（`--customvideo_config` 或 `/offer` 的 `custom_config`）。
+
+生成产物：
+- `data/avatars/{avatar_id}/actions/{idle|reply|think}/`：动作帧序列 `00000001.png`（25fps）+ 讲解/思考的 `reply.wav` / `think.wav`（16k mono）；
+- `data/avatars/{avatar_id}/actions.json`：运行时 per-avatar 自动加载的动作配置（结构同 `custom_config`）；
+- `data/avatars/{avatar_id}/avatar.json`：形象元信息（`avatar_id/name/model/created_at/actions`）。
+
+### 5.1 更新已有形象的动作片段
+
+```
+POST /api/avatar/actions
+```
+
+**Content-Type**: `application/json` 或 `multipart/form-data`（上传视频时）
+
+| 参数 | 必填 | 类型 | 说明 |
+|------|------|------|------|
+| `avatar_id` | 是 | string | 形象 ID |
+| `video_file` | 否 | file | 上传的视频（存 `./data/tmp/`） |
+| `video_path` | 条件 | string | 视频本地路径（未上传 `video_file` 时必填） |
+| `actions` | 是 | string | 动作片段标记 JSON 字符串（格式同上） |
+
+同步执行，返回更新后的动作配置项列表。注意：该接口会**按本次传入的 actions 覆盖** `actions.json`（未标记的动作将被移除）。
+
+### 5.2 列出已创建形象
+
+```
+GET /api/avatar/list
+```
+
+扫描 `data/avatars/*/avatar.json` 返回形象列表（按 `created_at` 降序）。无 `avatar.json` 但存在 `full_imgs/` 的目录（命令行创建的形象）也会列出。
+
+**响应**:
+
+```json
+{
+  "code": 0,
+  "msg": "ok",
+  "data": {
+    "avatars": [
+      { "avatar_id": "avatar1", "name": "张三", "model": "wav2lip", "created_at": 1713916800.0, "actions": {} }
+    ]
+  }
+}
+```
+
+### 5.3 获取形象详情
+
+```
+GET /api/avatar/{avatar_id}
+```
+
+返回单个形象详情：`avatar.json` 元信息 + `actions.json` 动作配置 + `has_base`（是否已生成基底）。形象不存在返回 404。

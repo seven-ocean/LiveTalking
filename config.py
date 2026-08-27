@@ -53,7 +53,9 @@ def parse_args():
 
     # ─── 自定义动作和多形象 ────────────────────────────────────────────
     parser.add_argument('--customvideo_config', type=str, default='',
-                        help="custom action json")
+                        help="custom action json。每项结构: {\"audiotype\": 2, \"imgpath\": \"data/actions/wave\", "
+                             "\"audiopath\": \"data/actions/wave.wav\"(可选), \"avatar_id\": \"avatar1\"(可选，"
+                             "空/缺省=全局动作，指定=仅该形象可用)}。形象本地 data/avatars/{avatar_id}/actions.json 优先于此配置")
 
     # ─── TTS ───────────────────────────────────────────────────────────
     parser.add_argument('--tts', type=str, default='edgetts',

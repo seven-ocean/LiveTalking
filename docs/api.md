@@ -29,7 +29,7 @@ POST /offer
 | `avatar` | 否 | string | 启动参数值 | 指定数字人 ID |
 | `refaudio` | 否 | string | — | 参考音频 |
 | `reftext` | 否 | string | — | 参考文本 |
-| `custom_config` | 否 | string | — | 动作编排配置 JSON 字符串 |
+| `custom_config` | 否 | string | — | 动作编排配置 JSON 字符串（每项支持可选 `avatar_id` 字段，空/缺省=全局动作，指定=仅该形象可用；形象本地 `actions.json` 优先于此参数） |
 
 **响应**:
 

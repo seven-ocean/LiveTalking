@@ -228,18 +228,63 @@ class BaseAvatar:
         return self.speaking
     
     def __loadcustom(self):
-        if not hasattr(self.opt, 'customopt') or not self.opt.customopt:
-            return
-        for item in self.opt.customopt:
+        """加载自定义动作配置（动作编排）。
+
+        加载顺序（同一 audiotype，高优先级覆盖低优先级）：
+          1) per-avatar 本地配置 data/avatars/{avatar_id}/actions.json —— 该形象自己的动作，最高优先；
+          2) 显式配置（CLI --customvideo_config / offer custom_config）—— 按 avatar_id 过滤后兜底，
+             仅补充 actions.json 未覆盖的 audiotype；配置项 avatar_id 字段为空或缺省视为全局动作。
+
+        这样在 A 形象切换到 B 形象时，B 只加载 B 自己的动作（per-avatar 优先），
+        全局/跨形象的动作项被过滤，避免自定义动作串用。
+        """
+        avatar_id = getattr(self.opt, 'avatar_id', '')
+        merged = []
+        seen_types = set()
+
+        # 1) per-avatar 本地配置：data/avatars/{avatar_id}/actions.json（操作台生成）
+        action_file = os.path.join('data', 'avatars', avatar_id, 'actions.json')
+        if avatar_id and os.path.exists(action_file):
+            try:
+                with open(action_file, 'r', encoding='utf-8') as f:
+                    local_items = json.load(f)
+                merged.extend(local_items)
+                seen_types = {item['audiotype'] for item in local_items}
+                logger.info(f"[custom] 形象 {avatar_id} 加载 per-avatar 动作 {len(local_items)} 项: {action_file}")
+            except Exception as e:
+                logger.error(f"[custom] 加载 {action_file} 失败: {e}")
+
+        # 2) 显式配置（CLI customvideo_config / offer custom_config）：按 avatar_id 过滤
+        if hasattr(self.opt, 'customopt') and self.opt.customopt:
+            for item in self.opt.customopt:
+                item_avatar = item.get('avatar_id', '')
+                if item_avatar and item_avatar != avatar_id:
+                    logger.warning(f"[custom] 跳过 {item_avatar} 的动作项（当前形象 {avatar_id}）")
+                    continue
+                if item['audiotype'] in seen_types:
+                    continue  # 形象自己的动作优先，全局项不覆盖
+                merged.append(item)
+                seen_types.add(item['audiotype'])
+
+        # 3) 逐项加载；imgpath 无匹配图片时跳过并告警
+        for item in merged:
+            if item.get('audiotype') is None:
+                logger.warning(f"[custom] 跳过无效动作项（缺少 audiotype）: {item}")
+                continue
             logger.info(item)
             input_img_list = glob.glob(os.path.join(item['imgpath'], '*.[jpJP][pnPN]*[gG]'))
+            if not input_img_list:
+                logger.warning(f"[custom] 跳过动作 audiotype={item['audiotype']}: imgpath 无匹配图片: {item.get('imgpath')}")
+                continue
             input_img_list = sorted(input_img_list, key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
             self.custom_img_cycle[item['audiotype']] = read_imgs(input_img_list)
             if item.get('audiopath'):
-                self.custom_audio_cycle[item['audiotype']], sample_rate = sf.read(item['audiopath'], dtype='float32')
-                self.custom_audio_index[item['audiotype']] = 0
+                if os.path.exists(item['audiopath']):
+                    self.custom_audio_cycle[item['audiotype']], sample_rate = sf.read(item['audiopath'], dtype='float32')
+                    self.custom_audio_index[item['audiotype']] = 0
+                else:
+                    logger.warning(f"[custom] 动作 audiotype={item['audiotype']} audiopath 不存在: {item['audiopath']}")
             self.custom_index[item['audiotype']] = 0
-            # self.custom_opt[item['audiotype']] = item
 
     def init_customindex(self):
         self.custom_audiotype = 0
