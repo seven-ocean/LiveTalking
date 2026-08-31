@@ -3,6 +3,7 @@ import time
 import threading
 import json
 import os
+import shutil
 import requests
 import cv2
 from concurrent.futures import ThreadPoolExecutor
@@ -86,30 +87,43 @@ class TaskManager:
             def progress_callback(p):
                 task.progress = p
 
+            save_path = task.params.get('save_path', './data/avatars')
+            # 编辑模式：skip_base 且基座已存在时跳过基座重新生成，只重生成动作帧 + 讲解形象
+            skip_base = bool(task.params.get('skip_base', False))
+            base_exists = os.path.isdir(os.path.join(save_path, task.avatar_id, 'full_imgs'))
+
             if task.model_type == "musetalk":
                 from avatars.musetalk.genavatar import generate_avatar
-                generate_avatar(
-                    video_path=task.params['video_path'],
-                    avatar_id=task.avatar_id,
-                    save_path=task.params.get('save_path', './data/avatars'),
-                    bbox_shift=task.params.get('bbox_shift', 0),
-                    extra_margin=task.params.get('extra_margin', 10),
-                    parsing_mode=task.params.get('parsing_mode', 'jaw'),
-                    version=task.params.get('version', 'v15'),
-                    progress_callback=progress_callback
-                )
+                if skip_base and base_exists:
+                    logger.info(f"Task {task_id}: skip_base 且基座已存在，跳过基座生成（编辑模式）")
+                    task.progress = 20
+                else:
+                    generate_avatar(
+                        video_path=task.params['video_path'],
+                        avatar_id=task.avatar_id,
+                        save_path=save_path,
+                        bbox_shift=task.params.get('bbox_shift', 0),
+                        extra_margin=task.params.get('extra_margin', 10),
+                        parsing_mode=task.params.get('parsing_mode', 'jaw'),
+                        version=task.params.get('version', 'v15'),
+                        progress_callback=progress_callback
+                    )
             elif task.model_type == "wav2lip":
                 from avatars.wav2lip.genavatar import generate_avatar
-                generate_avatar(
-                    video_path=task.params['video_path'],
-                    avatar_id=task.avatar_id,
-                    save_path=task.params.get('save_path', './data/avatars'),
-                    img_size=task.params.get('img_size', 96),
-                    pads=task.params.get('pads', [0, 10, 0, 0]),
-                    nosmooth=task.params.get('nosmooth', False),
-                    face_det_batch_size=task.params.get('face_det_batch_size', 16),
-                    progress_callback=progress_callback
-                )
+                if skip_base and base_exists:
+                    logger.info(f"Task {task_id}: skip_base 且基座已存在，跳过基座生成（编辑模式）")
+                    task.progress = 20
+                else:
+                    generate_avatar(
+                        video_path=task.params['video_path'],
+                        avatar_id=task.avatar_id,
+                        save_path=save_path,
+                        img_size=task.params.get('img_size', 96),
+                        pads=task.params.get('pads', [0, 10, 0, 0]),
+                        nosmooth=task.params.get('nosmooth', False),
+                        face_det_batch_size=task.params.get('face_det_batch_size', 16),
+                        progress_callback=progress_callback
+                    )
             else:
                 raise ValueError(f"Unsupported model type: {task.model_type}")
 
@@ -118,16 +132,58 @@ class TaskManager:
             if isinstance(actions_param, str):
                 actions_param = json.loads(actions_param)
             avatar_name = task.params.get('name')
+            reply_avatar_id = None
 
             if actions_param:
-                from server.action_builder import build_avatar_actions
+                from server.action_builder import build_avatar_actions, build_avatar_meta, extract_segment_video
+
+                # ── 讲解片段 → 生成独立讲解形象（说话自动进讲解，TTS 推理对口型用）──
+                reply_seg = None
+                if isinstance(actions_param, dict):
+                    reply_seg = actions_param.get('reply')
+                if reply_seg and task.model_type == "wav2lip":
+                    seg_video = None
+                    try:
+                        reply_avatar_id = f"{task.avatar_id}_reply"
+                        seg_video = os.path.join('data', 'tmp', f"{uuid.uuid4()}_reply_segment.mp4")
+                        extract_segment_video(task.params['video_path'], float(reply_seg['start']), float(reply_seg['end']), seg_video)
+
+                        def reply_progress(p):
+                            task.progress = 20 + int(p * 0.5)  # 20 -> 70，动作帧阶段(85~100)留出空间
+
+                        generate_avatar(
+                            video_path=seg_video,
+                            avatar_id=reply_avatar_id,
+                            save_path=save_path,
+                            img_size=task.params.get('img_size', 96),
+                            pads=task.params.get('pads', [0, 10, 0, 0]),
+                            nosmooth=task.params.get('nosmooth', False),
+                            face_det_batch_size=task.params.get('face_det_batch_size', 4),
+                            progress_callback=reply_progress
+                        )
+                        # 讲解形象元信息（name 标注讲解形象）
+                        build_avatar_meta(reply_avatar_id, f"{task.avatar_id}_讲解", task.model_type, {}, save_path=save_path)
+                        logger.info(f"Task {task_id}: 讲解形象 {reply_avatar_id} 生成完成")
+                    except Exception as e:
+                        logger.error(f"Task {task_id} 讲解形象生成失败: {e}")
+                        raise
+                    finally:
+                        if seg_video and os.path.exists(seg_video):
+                            os.remove(seg_video)
+                            logger.info(f"Task {task_id}: 已清理临时讲解片段 {seg_video}")
+                else:
+                    # 编辑模式：用户移除讲解片段时，清理遗留的讲解形象
+                    if skip_base and os.path.isdir(os.path.join(save_path, f"{task.avatar_id}_reply")):
+                        shutil.rmtree(os.path.join(save_path, f"{task.avatar_id}_reply"), ignore_errors=True)
+                        logger.info(f"Task {task_id}: 讲解片段已移除，清理讲解形象 {task.avatar_id}_reply")
+
                 def actions_progress(p):
                     task.progress = p
                 build_avatar_actions(
                     avatar_id=task.avatar_id,
                     video_path=task.params['video_path'],
                     actions=actions_param,
-                    save_path=task.params.get('save_path', './data/avatars'),
+                    save_path=save_path,
                     progress_callback=actions_progress
                 )
 
@@ -137,7 +193,8 @@ class TaskManager:
                     avatar_id=task.avatar_id,
                     name=avatar_name,
                     model=task.model_type,
-                    actions=actions_param or {}
+                    actions=actions_param or {},
+                    reply_avatar_id=reply_avatar_id
                 )
 
             task.status = "completed"

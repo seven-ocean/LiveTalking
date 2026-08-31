@@ -62,6 +62,9 @@ async def create_avatar_task(request):
         if not model_type or not avatar_id:
             return json_error("model and avatar_id are required")
 
+        if avatar_id.endswith('_reply'):
+            return json_error("avatar_id 不能以 _reply 结尾（该后缀为讲解子形象保留）")
+
         if 'video_path' not in params:
             return json_error("video_file or video_path is required")
 
@@ -82,8 +85,13 @@ async def create_avatar_task(request):
             "extra_margin": int(params.get('extra_margin', 10)),
             "parsing_mode": params.get('parsing_mode', 'jaw'),
             "version": params.get('version', 'v15'),
-            "face_det_batch_size": int(params.get('face_det_batch_size', 16))
+            "face_det_batch_size": int(params.get('face_det_batch_size', 4))
         }
+
+        # 编辑模式：跳过基座重新生成，只重生成动作帧 + 讲解形象
+        if params.get('skip_base') is not None:
+            sv = params.get('skip_base')
+            task_params['skip_base'] = sv.lower() in ('true', '1', 'yes') if isinstance(sv, str) else bool(sv)
 
         # 动作编排：形象命名 + 动作片段标记（{"idle": {"start": s, "end": e}, ...}）
         if params.get('name'):
@@ -230,6 +238,8 @@ async def list_avatars(request):
                 avatar_dir = os.path.join(data_root, name)
                 if not os.path.isdir(avatar_dir) or name.startswith('.'):
                     continue
+                if name.endswith('_reply'):
+                    continue  # 讲解子形象隐藏，父形象以「讲解✓」徽标呈现
                 meta_file = os.path.join(avatar_dir, 'avatar.json')
                 actions_file = os.path.join(avatar_dir, 'actions.json')
                 if os.path.exists(meta_file):
@@ -237,6 +247,7 @@ async def list_avatars(request):
                         with open(meta_file, 'r', encoding='utf-8') as f:
                             meta = json.load(f)
                         meta['actions'] = meta.get('actions', {})
+                        meta['has_reply_avatar'] = bool(meta.get('reply_avatar_id'))
                         avatars.append(meta)
                         continue
                     except Exception as e:
@@ -261,6 +272,7 @@ async def list_avatars(request):
                         "model": "",
                         "created_at": created_at,
                         "actions": actions,
+                        "has_reply_avatar": os.path.isdir(os.path.join(data_root, f"{name}_reply")),
                     })
         avatars.sort(key=lambda x: x.get('created_at', 0), reverse=True)
         return json_ok(data={"avatars": avatars})
@@ -298,6 +310,8 @@ async def get_avatar_detail(request):
                 logger.warning(f"[avatar] 读取 {actions_file} 失败: {e}")
         meta['actions'] = actions
         meta['has_base'] = os.path.isdir(os.path.join(avatar_dir, 'full_imgs'))
+        meta['has_reply_avatar'] = bool(meta.get('reply_avatar_id')) or os.path.isdir(
+            os.path.join(os.path.dirname(avatar_dir), f"{avatar_id}_reply"))
         return json_ok(data=meta)
     except Exception as e:
         logger.exception("get_avatar_detail error:")

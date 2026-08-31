@@ -370,6 +370,9 @@ class BaseAvatar:
     #         return size - res - 1 
     
     def get_custom_audio_stream(self, audiotype):
+        if self.custom_audio_index.get(audiotype) is None:
+            # 该动作未配置固定音频（如讲解 reply / 无音频的思考），返回静音帧避免 KeyError
+            return np.zeros(self.chunk, dtype=np.float32)
         idx = self.custom_audio_index[audiotype]
         stream = self.custom_audio_cycle[audiotype][idx:idx+self.chunk]
         self.custom_audio_index[audiotype] += self.chunk
@@ -379,12 +382,16 @@ class BaseAvatar:
     
     def set_custom_state(self, audiotype, reinit=True):
         print('set_custom_state:', audiotype)
-        if self.custom_audio_index.get(audiotype) is None:
+        # 以画面帧为门禁：无画面帧的动作无法显式切换；
+        # 原实现以 custom_audio_index 为门禁，导致无固定音频的动作（idle=1 / think=3）无法切换
+        if self.custom_img_cycle.get(audiotype) is None:
             return
         self.custom_audiotype = audiotype
         if reinit:
-            self.custom_audio_index[audiotype] = 0
-            self.custom_index[audiotype] = 0
+            if audiotype in self.custom_audio_index:
+                self.custom_audio_index[audiotype] = 0
+            if audiotype in self.custom_index:
+                self.custom_index[audiotype] = 0
 
     # ========================== 核心渲染及 Pipeline 桥接 ==========================
     def get_avatar_length(self):

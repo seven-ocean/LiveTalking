@@ -55,18 +55,23 @@ class BaseASR:
 
     #return frame:audio pcm; type: 0-normal speak, 1-silence; eventpoint:custom event sync with audio
     def get_audio_frame(self)->AudioFrameData:        
+        audiotype = self.parent.custom_audiotype if self.parent else 0
         try:
-            if self.parent and self.parent.custom_audiotype>1: #播放自定义音频,优先播放完自定义动作,可以通过interrupt打断动作播放
-                frame = self.parent.get_custom_audio_stream(self.parent.custom_audiotype)
-                type = self.parent.custom_audiotype
-                return AudioFrameData(data=frame, type=type, userdata={})
+            # 仅当当前动作「配有固定音频」（如思考 think）时优先播放固定音频；
+            # 讲解 reply 不配固定音频（由 TTS 推理驱动对口型），直接走 TTS 队列，
+            # 避免原实现 custom_audiotype>1 时固定 wav 阻塞 TTS 的问题（G1/G3）。
+            if self.parent and audiotype in self.parent.custom_audio_cycle:
+                frame = self.parent.get_custom_audio_stream(audiotype)
+                return AudioFrameData(data=frame, type=audiotype, userdata={})
             else:
                 frame = self.queue.get(block=True,timeout=0.01)
                 return frame
             #print(f'[INFO] get frame {frame.shape}')
         except queue.Empty:
-            frame = np.zeros(self.chunk, dtype=np.float32)
-            return AudioFrameData(data=frame, type=1, userdata={})
+            # 显式动作态（custom_audiotype>0）下静音帧携带对应 type，
+            # 使 process_frames 静音分支展示该动作固定帧；正常/idle 回落 type=1
+            t = audiotype if audiotype > 0 else 1
+            return AudioFrameData(data=np.zeros(self.chunk, dtype=np.float32), type=t, userdata={})
 
 
     #return frame:audio pcm; type: 0-normal speak, 1-silence; eventpoint:custom event sync with audio

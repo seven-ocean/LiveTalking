@@ -230,7 +230,7 @@
                         <div class="action-title">
                             <span class="me-2">讲解动作</span>
                             <span class="badge text-bg-secondary status-badge">未设置</span>
-                            <span class="hint-text ms-2">（画面 + 音频，讲解时播放）</span>
+                            <span class="hint-text ms-2">（讲解由 TTS 推理对口型，创建时自动生成独立讲解形象）</span>
                         </div>
                         <div class="row g-2">
                             <div class="col-5">
@@ -512,6 +512,7 @@
         const file = videoFileInput.files[0];
 
         if (!avatarId) { alert('请填写形象 ID'); return; }
+        if (avatarId.endsWith('_reply')) { alert('形象 ID 不能以 _reply 结尾（该后缀为讲解子形象保留）'); return; }
         if (!name) { alert('请填写形象名称'); return; }
         if (!file) { alert('请上传主视频'); return; }
 
@@ -535,9 +536,10 @@
         formData.append('extra_margin', document.getElementById('extraMarginInput').value);
         formData.append('parsing_mode', document.getElementById('parsingModeInput').value);
 
-        const endpoint = editingAvatarId
-            ? '/api/avatar/actions'
-            : '/api/avatar/task';
+        // 创建/编辑统一走异步任务：编辑模式携带 skip_base，后端跳过基座重新生成，
+        // 只重生成动作帧 + 讲解形象（复用进度轮询）
+        const endpoint = '/api/avatar/task';
+        if (editingAvatarId) formData.append('skip_base', 'true');
 
         const submitBtn = document.getElementById('submitBtn');
         submitBtn.disabled = true;
@@ -548,14 +550,8 @@
             const result = await resp.json();
             if (result.code !== 0) { alert('提交失败: ' + result.msg); return; }
 
-            if (editingAvatarId) {
-                alert('动作更新成功！');
-                exitEditMode();
-                loadAvatars();
-            } else {
-                // 轮询任务进度
-                startPolling(result.data.task_id);
-            }
+            // 创建/编辑统一轮询任务进度（编辑模式由后端跳过基座重新生成）
+            startPolling(result.data.task_id);
         } catch (err) {
             console.error(err);
             alert('提交发生网络错误');
@@ -585,12 +581,17 @@
                 bar.textContent = t.progress + '%';
                 text.textContent = t.progress + '%';
                 statusText.textContent = t.status === 'running' || t.status === 'pending'
-                    ? '形象生成中（基座训练较耗时，请耐心等待）...'
+                    ? '形象生成中（含讲解形象生成，请耐心等待）...'
                     : t.status;
                 if (t.status === 'completed') {
                     stopPolling();
                     area.style.display = 'none';
-                    alert('形象创建成功！');
+                    if (editingAvatarId) {
+                        alert('动作更新成功！');
+                        exitEditMode();
+                    } else {
+                        alert('形象创建成功！');
+                    }
                     loadAvatars();
                 } else if (t.status === 'failed') {
                     stopPolling();
@@ -626,6 +627,8 @@
                 const actions = a.actions || {};
                 const hasIdle = Array.isArray(actions) ? actions.some(x => x.audiotype === 1) : !!actions.idle;
                 const hasReply = Array.isArray(actions) ? actions.some(x => x.audiotype === 2) : !!actions.reply;
+                // 讲解形象由后端回填 has_reply_avatar（隐藏 _reply 子形象），老数据回退 actions 判断
+                const hasReplyAvatar = typeof a.has_reply_avatar === 'boolean' ? a.has_reply_avatar : hasReply;
                 const hasThink = Array.isArray(actions) ? actions.some(x => x.audiotype === 3) : !!actions.think;
                 const date = a.created_at ? new Date(a.created_at * 1000).toLocaleString() : '--';
                 return `
@@ -641,7 +644,7 @@
                             </div>
                             <div class="small mt-1">
                                 <span class="badge ${hasIdle ? 'text-bg-success' : 'text-bg-secondary'}">待机${hasIdle ? '✓' : ''}</span>
-                                <span class="badge ${hasReply ? 'text-bg-success' : 'text-bg-secondary'}">讲解${hasReply ? '✓' : ''}</span>
+                                <span class="badge ${hasReplyAvatar ? 'text-bg-success' : 'text-bg-secondary'}">讲解${hasReplyAvatar ? '✓' : ''}</span>
                                 <span class="badge ${hasThink ? 'text-bg-success' : 'text-bg-secondary'}">思考${hasThink ? '✓' : ''}</span>
                             </div>
                         </div>

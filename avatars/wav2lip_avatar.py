@@ -28,6 +28,7 @@ import cv2
 import glob
 import pickle
 import copy
+import json
 
 import queue
 from queue import Queue
@@ -175,6 +176,30 @@ class LipReal(BaseAvatar):
         self.model = model
 
         self.frame_list_cycle,self.face_list_cycle,self.coord_list_cycle = avatar
+
+        # ── 讲解独立形象（说话自动进讲解）────────────────────────────
+        # 形象工作台创建时会把讲解片段单独生成一个形象（{avatar_id}_reply），
+        # 并写入基座 avatar.json 的 reply_avatar_id 字段。若存在，则将推理数据源
+        # 整体替换为讲解形象：任何 TTS 说话都会在「讲解片段」的姿态/背景上推理对口型，
+        # 即满足「讲解动作由 TTS 推理驱动、不朗读固定音频」；待机/思考固定帧仍由
+        # 基座 actions.json 的 custom_img_cycle[1/3] 提供，互不冲突。
+        self.reply_avatar = None
+        reply_avatar_id = None
+        meta_file = os.path.join('data', 'avatars', opt.avatar_id, 'avatar.json')
+        try:
+            if os.path.exists(meta_file):
+                with open(meta_file, 'r', encoding='utf-8') as f:
+                    reply_avatar_id = json.load(f).get('reply_avatar_id')
+        except Exception as e:
+            logger.warning(f"[wav2lip] 读取 {meta_file} 失败: {e}")
+        if reply_avatar_id:
+            if os.path.isdir(os.path.join('data', 'avatars', reply_avatar_id)):
+                try:
+                    self.reply_avatar = load_avatar(reply_avatar_id)
+                    self.frame_list_cycle, self.face_list_cycle, self.coord_list_cycle = self.reply_avatar
+                    logger.info(f"[wav2lip] 形象 {opt.avatar_id} 加载讲解形象 {reply_avatar_id}，说话自动进讲解")
+                except Exception as e:
+                    logger.error(f"[wav2lip] 加载讲解形象 {reply_avatar_id} 失败，回退基座推理: {e}")
 
         self.asr = MelASR(opt,self)
         self.asr.warm_up()

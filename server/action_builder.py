@@ -23,8 +23,8 @@ AUDIOTYPE_MAP = {"idle": 1, "reply": 2, "think": 3}
 ACTION_DIRS = {"idle": "idle", "reply": "reply", "think": "think"}
 FPS = 25  # 动作帧序列帧率
 
-# 需要提取音频的动作（待机 idle 无音频，静默自动循环）
-AUDIO_ACTIONS = {"reply", "think"}
+# 需要提取音频的动作（待机 idle 无音频，静默自动循环；讲解 reply 由 TTS 推理驱动，不抽固定音频）
+AUDIO_ACTIONS = {"think"}
 
 
 def _run_ffmpeg(cmd, purpose):
@@ -89,6 +89,25 @@ def extract_audio(video_path, start, end, out_wav):
     _run_ffmpeg(cmd, f"提取动作音频 [{start}s~{end}s]")
 
 
+def extract_segment_video(video_path, start, end, out_mp4):
+    """从视频 [start, end] 秒截取片段 mp4（重编码，保证关键帧准确）。
+
+    供「讲解独立形象」生成：讲解片段抽子视频 → generate_avatar → 独立形象。
+    """
+    os.makedirs(os.path.dirname(out_mp4), exist_ok=True)
+    duration = max(end - start, 0.1)
+    cmd = ["ffmpeg", "-y",
+           "-ss", str(start), "-i", video_path,
+           "-t", str(duration),
+           "-c:v", "libx264", "-pix_fmt", "yuv420p",
+           "-c:a", "aac",
+           out_mp4]
+    _run_ffmpeg(cmd, f"截取讲解片段 [{start}s~{end}s]")
+    if not os.path.exists(out_mp4) or os.path.getsize(out_mp4) == 0:
+        raise RuntimeError(f"[action] 截取讲解片段失败: {out_mp4}")
+    return out_mp4
+
+
 def _validate_actions(actions, duration):
     """校验动作片段参数，返回 {name: (start, end)}；非法项抛异常。"""
     result = {}
@@ -135,7 +154,8 @@ def build_avatar_actions(avatar_id, video_path, actions, save_path="./data/avata
     total = len(validated)
     for i, (name, (start, end)) in enumerate(validated.items()):
         sub_dir = os.path.join(actions_dir, ACTION_DIRS[name])
-        rel_path = os.path.join("data", "avatars", avatar_id, "actions", ACTION_DIRS[name])
+        # 统一正斜杠相对路径（跨平台：Windows/Linux 均可被 glob 识别，避免 Linux 部署动作跳过）
+        rel_path = f"data/avatars/{avatar_id}/actions/{ACTION_DIRS[name]}"
 
         logger.info(f"[action] 生成动作 {name}(audiotype={AUDIOTYPE_MAP[name]}): [{start}s~{end}s]")
         extract_frames(video_path, start, end, sub_dir)
@@ -145,7 +165,7 @@ def build_avatar_actions(avatar_id, video_path, actions, save_path="./data/avata
             wav_name = f"{ACTION_DIRS[name]}.wav"
             wav_path = os.path.join(sub_dir, wav_name)
             extract_audio(video_path, start, end, wav_path)
-            item["audiopath"] = os.path.join(rel_path, wav_name)
+            item["audiopath"] = f"{rel_path}/{wav_name}"  # 与 imgpath 一致，统一正斜杠
         items.append(item)
 
         if progress_callback:
@@ -158,8 +178,12 @@ def build_avatar_actions(avatar_id, video_path, actions, save_path="./data/avata
     return items
 
 
-def build_avatar_meta(avatar_id, name, model, actions, save_path="./data/avatars"):
-    """写入形象元信息 data/avatars/{avatar_id}/avatar.json。"""
+def build_avatar_meta(avatar_id, name, model, actions, save_path="./data/avatars", reply_avatar_id=None):
+    """写入形象元信息 data/avatars/{avatar_id}/avatar.json。
+
+    Args:
+        reply_avatar_id: 讲解独立形象 ID（讲解片段生成），写入 avatar.json 供运行时加载推理。
+    """
     avatar_dir = os.path.join(save_path, avatar_id)
     os.makedirs(avatar_dir, exist_ok=True)
     meta = {
@@ -169,6 +193,8 @@ def build_avatar_meta(avatar_id, name, model, actions, save_path="./data/avatars
         "created_at": time.time(),
         "actions": actions or {},
     }
+    if reply_avatar_id:
+        meta["reply_avatar_id"] = reply_avatar_id
     meta_file = os.path.join(avatar_dir, "avatar.json")
     with open(meta_file, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=4)
