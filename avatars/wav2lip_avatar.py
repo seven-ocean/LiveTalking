@@ -177,12 +177,13 @@ class LipReal(BaseAvatar):
 
         self.frame_list_cycle,self.face_list_cycle,self.coord_list_cycle = avatar
 
-        # ── 讲解独立形象（说话自动进讲解）────────────────────────────
-        # 形象工作台创建时会把讲解片段单独生成一个形象（{avatar_id}_reply），
+        # ── 讲解独立形象（旧版兼容，仅历史两目录形象触发）────────────
+        # 历史版本（形象工作台早期）会把讲解片段单独生成一个形象（{avatar_id}_reply），
         # 并写入基座 avatar.json 的 reply_avatar_id 字段。若存在，则将推理数据源
-        # 整体替换为讲解形象：任何 TTS 说话都会在「讲解片段」的姿态/背景上推理对口型，
-        # 即满足「讲解动作由 TTS 推理驱动、不朗读固定音频」；待机/思考固定帧仍由
-        # 基座 actions.json 的 custom_img_cycle[1/3] 提供，互不冲突。
+        # 整体替换为讲解形象，使任何 TTS 说话都在「讲解片段」的姿态/背景上推理对口型。
+        # 新版单目录方案创建的形象不再写入 reply_avatar_id（基座推理源已直接由讲解片段
+        # 生成），因此不会触发本逻辑；此处仅保证旧形象（如 wav2lip256_avatar7_action）
+        # 不回归「说话混用整套视频帧」的行为。
         self.reply_avatar = None
         reply_avatar_id = None
         meta_file = os.path.join('data', 'avatars', opt.avatar_id, 'avatar.json')

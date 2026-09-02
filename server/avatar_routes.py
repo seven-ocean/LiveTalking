@@ -247,7 +247,8 @@ async def list_avatars(request):
                         with open(meta_file, 'r', encoding='utf-8') as f:
                             meta = json.load(f)
                         meta['actions'] = meta.get('actions', {})
-                        meta['has_reply_avatar'] = bool(meta.get('reply_avatar_id'))
+                        # has_reply_avatar：有讲解动作即标记（单目录方案下无 _reply 子形象，靠 actions 判定；旧数据兼容 reply_avatar_id）
+                        meta['has_reply_avatar'] = bool(meta.get('reply_avatar_id')) or 'reply' in (meta.get('actions') or {})
                         avatars.append(meta)
                         continue
                     except Exception as e:
@@ -272,7 +273,8 @@ async def list_avatars(request):
                         "model": "",
                         "created_at": created_at,
                         "actions": actions,
-                        "has_reply_avatar": os.path.isdir(os.path.join(data_root, f"{name}_reply")),
+                        "has_reply_avatar": any(item.get('audiotype') == 2 for item in actions) or os.path.isdir(
+                            os.path.join(data_root, f"{name}_reply")),
                     })
         avatars.sort(key=lambda x: x.get('created_at', 0), reverse=True)
         return json_ok(data={"avatars": avatars})
@@ -310,7 +312,9 @@ async def get_avatar_detail(request):
                 logger.warning(f"[avatar] 读取 {actions_file} 失败: {e}")
         meta['actions'] = actions
         meta['has_base'] = os.path.isdir(os.path.join(avatar_dir, 'full_imgs'))
-        meta['has_reply_avatar'] = bool(meta.get('reply_avatar_id')) or os.path.isdir(
+        # actions 为 actions.json 列表（含 audiotype），讲解=2；旧数据兼容 reply_avatar_id / _reply 目录
+        meta['has_reply_avatar'] = bool(meta.get('reply_avatar_id')) or any(
+            item.get('audiotype') == 2 for item in actions) or os.path.isdir(
             os.path.join(os.path.dirname(avatar_dir), f"{avatar_id}_reply"))
         return json_ok(data=meta)
     except Exception as e:

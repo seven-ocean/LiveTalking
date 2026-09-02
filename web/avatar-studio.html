@@ -230,7 +230,7 @@
                         <div class="action-title">
                             <span class="me-2">讲解动作</span>
                             <span class="badge text-bg-secondary status-badge">未设置</span>
-                            <span class="hint-text ms-2">（讲解由 TTS 推理对口型，创建时自动生成独立讲解形象）</span>
+                            <span class="hint-text ms-2">（讲解由 TTS 推理对口型，讲解片段作为形象推理源）</span>
                         </div>
                         <div class="row g-2">
                             <div class="col-5">
@@ -536,8 +536,7 @@
         formData.append('extra_margin', document.getElementById('extraMarginInput').value);
         formData.append('parsing_mode', document.getElementById('parsingModeInput').value);
 
-        // 创建/编辑统一走异步任务：编辑模式携带 skip_base，后端跳过基座重新生成，
-        // 只重生成动作帧 + 讲解形象（复用进度轮询）
+        // 创建/编辑统一走异步任务：编辑模式携带 skip_base，后端仅当讲解片段/基座推理源变化时重建基座
         const endpoint = '/api/avatar/task';
         if (editingAvatarId) formData.append('skip_base', 'true');
 
@@ -581,7 +580,7 @@
                 bar.textContent = t.progress + '%';
                 text.textContent = t.progress + '%';
                 statusText.textContent = t.status === 'running' || t.status === 'pending'
-                    ? '形象生成中（含讲解形象生成，请耐心等待）...'
+                    ? '形象生成中（讲解片段作为推理源，请耐心等待）...'
                     : t.status;
                 if (t.status === 'completed') {
                     stopPolling();

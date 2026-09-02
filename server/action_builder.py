@@ -178,11 +178,14 @@ def build_avatar_actions(avatar_id, video_path, actions, save_path="./data/avata
     return items
 
 
-def build_avatar_meta(avatar_id, name, model, actions, save_path="./data/avatars", reply_avatar_id=None):
+def build_avatar_meta(avatar_id, name, model, actions, save_path="./data/avatars",
+                      base_source='full', reply_seg=None):
     """写入形象元信息 data/avatars/{avatar_id}/avatar.json。
 
     Args:
-        reply_avatar_id: 讲解独立形象 ID（讲解片段生成），写入 avatar.json 供运行时加载推理。
+        base_source: 基座推理源来源：'reply'=由讲解片段生成（单目录方案，不再生成 _reply 子形象）/
+                     'full'=由整套视频生成。
+        reply_seg: 讲解片段 {"start": s, "end": e}（有讲解时记录，供编辑模式判断基座是否需要重建）。
     """
     avatar_dir = os.path.join(save_path, avatar_id)
     os.makedirs(avatar_dir, exist_ok=True)
@@ -192,9 +195,10 @@ def build_avatar_meta(avatar_id, name, model, actions, save_path="./data/avatars
         "model": model or "",
         "created_at": time.time(),
         "actions": actions or {},
+        "base_source": base_source,
     }
-    if reply_avatar_id:
-        meta["reply_avatar_id"] = reply_avatar_id
+    if reply_seg:
+        meta["reply_seg"] = reply_seg
     meta_file = os.path.join(avatar_dir, "avatar.json")
     with open(meta_file, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=4)
