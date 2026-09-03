@@ -9,12 +9,12 @@
   <a href=""><img src="https://img.shields.io/badge/os-linux%2C%20win%2C%20mac-pink.svg"></a>
 </p>
 <p align="center">
-<a href="https://trendshift.io/repositories/12565" target="_blank"><img src="https://trendshift.io/api/badge/repositories/12565" alt="lipku%2FLiveTalking | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
+<a href="https://trendshift.io/repositories/12565" target="_blank"><img src="https://trendshift.io/api/badge/repositories/12565" alt="lipku%2Fzl-talking | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 </p>
 
 实时交互流式数字人，实现音视频同步对话，基本可以达到商用效果。
 
-**声明**：本项目基于 LiveTalking 改造，版权归四川昱扬科技有限公司所有。
+**声明**：本项目基于 zl-talking 改造，版权归四川昱扬科技有限公司所有。
 
 ---
 

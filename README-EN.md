@@ -9,7 +9,7 @@
   <a href=""><img src="https://img.shields.io/badge/os-linux%2C%20win%2C%20mac-pink.svg"></a>
 </p>
 <p align="center">
-<a href="https://trendshift.io/repositories/12565" target="_blank"><img src="https://trendshift.io/api/badge/repositories/12565" alt="lipku%2FLiveTalking | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
+<a href="https://trendshift.io/repositories/12565" target="_blank"><img src="https://trendshift.io/api/badge/repositories/12565" alt="lipku%2Fzl-talking | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 </p>
 
 A real-time interactive streaming digital human system enabling synchronized audio-video conversation, meeting commercial application standards.
@@ -20,7 +20,7 @@ A real-time interactive streaming digital human system enabling synchronized aud
   <a href="https://youtu.be/vzUMruoZlxc/">musetalk Demo</a>
 </div>
 
-**Statement**: This project is based on LiveTalking and modified by Sichuan Yuyang Technology Co., Ltd. All rights reserved.
+**Statement**: This project is based on zl-talking and modified by Sichuan Yuyang Technology Co., Ltd. All rights reserved.
 
 ---
 
