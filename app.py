@@ -139,6 +139,15 @@ def main():
     from config import parse_args
     opt = parse_args()
 
+    # ─── 一机多卡负载均衡（GPU 网关模式入口）────────────────────────────
+    # --gpu-ids 非空 → app.py 自身作为网关：为每张参与卡拉起一个 worker 子进程并转发信令。
+    # --gpu-ids 留空   → 走下方原有单实例逻辑，行为与现状 100% 一致。
+    # worker 子进程的命令行由 gpu_lb 剔除全部多卡参数后回调本文件，不会递归进入本分支。
+    if getattr(opt, 'gpu_id_list', None):
+        from gpu_lb import main as lb_main
+        lb_main(opt)
+        return
+
     # ─── 加载 avatar 插件（触发 @register 注册）──────────────────────
     _avatar_modules = {
         'musetalk':   'avatars.musetalk_avatar',

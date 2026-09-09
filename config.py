@@ -118,9 +118,27 @@ def parse_args():
                         default=float(os.getenv('ZL_LICENSE_CHECK_TIMEOUT', '5')),
                         help="启动授权校验单次请求超时（秒），默认 5")
 
+    # ─── 一机多卡负载均衡（多卡网关模式参数；--gpu-ids 留空则完全不影响单卡）─────────
+    parser.add_argument('--gpu-ids', type=str, default='',
+                        help="参与负载均衡的物理卡子集，如 '0,1'；留空=单卡模式（原逻辑不变）")
+    parser.add_argument('--gpu-ids-strategy', type=str, default='least_session',
+                        choices=['least_session', 'round_robin'],
+                        help="选卡策略：least_session（空闲优先，默认）/ round_robin（轮询）")
+    parser.add_argument('--lb-worker-base-port', type=int, default=8011,
+                        help="多卡模式 worker 起始端口（第 i 张卡 → base_port + i）")
+    parser.add_argument('--lb-max-session-per-gpu', type=int, default=2,
+                        help="每卡最多同时分配的新会话数（达到上限时选卡跳过；全满则报错）")
+    parser.add_argument('--lb-health-interval', type=int, default=5,
+                        help="worker 健康/负载轮询间隔（秒）")
+    parser.add_argument('--lb-worker-wait-timeout', type=float, default=60.0,
+                        help="等待 worker 模型就绪超时（秒）")
+
     opt = parser.parse_args()
 
     # ─── 后处理 ────────────────────────────────────────────────────────
+    # 解析多卡物理卡子集：'0,1' → [0,1]；留空 → []（单卡模式，不启网关）
+    opt.gpu_id_list = [int(x) for x in opt.gpu_ids.split(',') if x.strip()]
+
     opt.customopt = []
     if opt.customvideo_config:
         with open(opt.customvideo_config, 'r') as f:
