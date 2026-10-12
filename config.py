@@ -82,16 +82,23 @@ def parse_args():
     parser.add_argument(
         '--ice_servers',
         type=str,
-        default='[{"urls": "stun:stun.freeswitch.org:3478"}]',
+        default='[]',
         help="JSON 格式的 ICE 服务器列表，可包含 STUN/TURN，例如 "
              '[{"urls":"stun:stun.example.com:3478"},'
-             '{"urls":"turn:turn.example.com:3478","username":"u","credential":"p"}]',
+             '{"urls":"turn:turn.example.com:3478","username":"u","credential":"p"}]。'
+             "默认为空（纯内网/离线场景无需公网 STUN，避免收集候选时等待公网 STUN 超时）",
     )
     parser.add_argument(
         '--offer_timeout',
         type=float,
         default=30.0,
-        help="服务端处理 /offer 的最大超时时间（秒），默认 30",
+        help="服务端处理 /offer 时，仅 SDP/ICE 协商阶段的最大超时时间（秒），默认 30",
+    )
+    parser.add_argument(
+        '--session_timeout',
+        type=float,
+        default=120.0,
+        help="服务端创建会话（含形象冷加载）阶段的最大超时时间（秒），默认 120",
     )
     parser.add_argument(
         '--ice_gathering_timeout',
@@ -150,8 +157,8 @@ def parse_args():
         if not isinstance(opt.ice_servers, list):
             raise ValueError('ice_servers must be a JSON list')
     except Exception as e:
-        print(f"[WARN] 解析 --ice_servers 失败 ({e})，使用默认 STUN 服务器")
-        opt.ice_servers = [{"urls": "stun:stun.freeswitch.org:3478"}]
+        print(f"[WARN] 解析 --ice_servers 失败 ({e})，回退为空 ICE 服务器列表")
+        opt.ice_servers = []
 
     # 应用 WebRTC 日志级别
     from utils.logger import set_webrtc_log_level

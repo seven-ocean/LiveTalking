@@ -26,7 +26,7 @@ import json
 import re
 import os
 import numpy as np
-from threading import Thread,Event
+from threading import Thread,Event,Lock
 #import multiprocessing
 import torch.multiprocessing as mp
 
@@ -46,6 +46,7 @@ from server.session_manager import session_manager
 import argparse
 import random
 import shutil
+import time
 import asyncio
 import torch
 import os
@@ -64,6 +65,13 @@ app = Flask(__name__)
 opt = None
 model = None
 global_avatars = {} # avatar_id: payload
+
+# ─── avatar 加载状态注册表（线程安全）────────────────────────────────
+# avatar_id -> {"status": "loading"|"ready"|"error", "startedAt": float,
+#               "elapsedMs": int|None, "error": str|None}
+_avatar_state: Dict[str, dict] = {}
+_avatar_state_lock = Lock()
+_avatar_load_lock = Lock()  # 保证同一时刻只有一个 avatar 冷加载（并发去重）
         
 
 #####webrtc###############################
@@ -76,6 +84,74 @@ def randN(N)->int:
     max = pow(10, N)
     return random.randint(min, max - 1)
 
+def _update_avatar_state(avatar_id: str, **fields):
+    """线程安全地更新 avatar 加载状态并返回最新快照。"""
+    with _avatar_state_lock:
+        st = dict(_avatar_state.get(avatar_id) or {})
+        st.update(fields)
+        _avatar_state[avatar_id] = st
+        return st
+
+def _get_avatar_state(avatar_id: str) -> dict:
+    with _avatar_state_lock:
+        return dict(_avatar_state.get(avatar_id) or {})
+
+def get_or_load_avatar(avatar_id: str):
+    """获取 avatar（缓存优先）；未缓存则加载。
+
+    并发调用同一 avatar 时由 _avatar_load_lock 串行去重，只有一个真正执行
+    load_avatar，其余在拿到锁后发现缓存已就绪直接复用。
+    """
+    cached = global_avatars.get(avatar_id)
+    if cached is not None:
+        return cached
+    with _avatar_load_lock:
+        cached = global_avatars.get(avatar_id)
+        if cached is not None:
+            return cached
+        started = time.time()
+        _update_avatar_state(avatar_id, status="loading", startedAt=started,
+                             elapsedMs=None, error=None)
+        try:
+            avatar = load_avatar(avatar_id)
+            global_avatars[avatar_id] = avatar
+            _update_avatar_state(avatar_id, status="ready",
+                                 elapsedMs=int((time.time() - started) * 1000))
+            return avatar
+        except BaseException as e:
+            _update_avatar_state(avatar_id, status="error",
+                                 elapsedMs=int((time.time() - started) * 1000),
+                                 error=str(e))
+            raise
+
+def _safe_load_avatar(avatar_id: str):
+    """后台线程入口：吞掉异常，仅记录日志（状态已写入注册表）。"""
+    try:
+        get_or_load_avatar(avatar_id)
+    except BaseException:
+        logger.exception("背景预热 avatar 失败: %s", avatar_id)
+
+def ensure_avatar_async(avatar_id: str) -> str:
+    """异步预热 avatar：后台线程加载，立即返回当前状态。
+
+    返回 "ready"（已缓存）或 "loading"（已触发/进行中）。幂等：
+    重复调用（含并发）不会重复加载。
+    """
+    if global_avatars.get(avatar_id) is not None:
+        return "ready"
+    with _avatar_state_lock:
+        st = _avatar_state.get(avatar_id) or {}
+        if st.get("status") == "loading":
+            return "loading"
+        _avatar_state[avatar_id] = {
+            "status": "loading",
+            "startedAt": time.time(),
+            "elapsedMs": None,
+            "error": None,
+        }
+    asyncio.get_event_loop().run_in_executor(None, _safe_load_avatar, avatar_id)
+    return "loading"
+
 def build_avatar_session(sessionid:str, params:dict)->BaseAvatar:
     opt_this = copy.deepcopy(opt)
     opt_this.sessionid = sessionid
@@ -85,10 +161,8 @@ def build_avatar_session(sessionid:str, params:dict)->BaseAvatar:
     ref_audio = params.get('refaudio','') #音色
     ref_text = params.get('reftext','')
     if (avatar_id and avatar_id != opt.avatar_id):
-        # Avoid reloading if already cached globally
-        if avatar_id not in global_avatars:
-            global_avatars[avatar_id] = load_avatar(avatar_id)
-        avatar_this = global_avatars[avatar_id]
+        # 缓存优先，未缓存则冷加载（与 /warmup 共用同一去重逻辑）
+        avatar_this = get_or_load_avatar(avatar_id)
     else:
         # Default avatar loaded at startup
         avatar_this = global_avatars.get(opt.avatar_id)
@@ -106,12 +180,38 @@ async def offer(request):
     return await rtc_manager.handle_offer(request)
 
 async def warmup_avatar(request):
-    """预热 avatar：前端切换形象前调用，避免首次 /offer 因冷加载超时。"""
+    """预热 avatar：前端切换形象前调用，后台异步加载，立即返回，避免阻塞事件循环。
+
+    幂等：重复/并发调用不会重复加载。契约：{code:0, status:"ready"|"loading"}。
+    """
     params = await request.json()
-    avatar_id = params.get('avatar')
-    if avatar_id and avatar_id not in global_avatars:
-        global_avatars[avatar_id] = load_avatar(avatar_id)
-    return web.Response(content_type="application/json", text=json.dumps({"code": 0}))
+    avatar_id = params.get('avatar') or opt.avatar_id
+    status = ensure_avatar_async(avatar_id)
+    return web.Response(content_type="application/json",
+                        text=json.dumps({"code": 0, "status": status}))
+
+async def warmup_status(request):
+    """查询 avatar 预热状态。
+
+    契约：{code:0, status:"ready"|"loading"|"error", elapsedMs, error?}
+    """
+    avatar_id = request.query.get('avatar') or opt.avatar_id
+    if global_avatars.get(avatar_id) is not None:
+        return web.Response(content_type="application/json",
+                            text=json.dumps({"code": 0, "status": "ready"}))
+    st = _get_avatar_state(avatar_id)
+    if not st:
+        # 未触发过预热：顺手触发，避免调用方轮询死等
+        ensure_avatar_async(avatar_id)
+        st = _get_avatar_state(avatar_id)
+    resp = {
+        "code": 0,
+        "status": st.get("status") or "loading",
+        "elapsedMs": st.get("elapsedMs"),
+    }
+    if st.get("error"):
+        resp["error"] = st["error"]
+    return web.Response(content_type="application/json", text=json.dumps(resp))
 
 async def on_shutdown(app):
     await rtc_manager.shutdown()
@@ -229,6 +329,7 @@ def main():
     appasync.router.add_post("/offer", offer)
     appasync.router.add_get("/record/{sessionid}", download_record)
     appasync.router.add_post("/warmup", warmup_avatar)
+    appasync.router.add_get("/warmup/status", warmup_status)
     
     # 注册 server/routes.py 中的通用 API 路由
     setup_routes(appasync)

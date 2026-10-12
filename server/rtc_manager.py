@@ -44,11 +44,13 @@ class RTCManager:
         self.pcs: set = set()
 
     def _build_ice_servers(self) -> List[RTCIceServer]:
-        """根据配置构建 RTCIceServer 列表，支持 STUN/TURN。"""
+        """根据配置构建 RTCIceServer 列表，支持 STUN/TURN。
+
+        配置为空时返回空列表：纯内网/离线场景无需公网 STUN，
+        否则 setLocalDescription 收集候选时会等待公网 STUN 事务超时（约 5s）。
+        """
         servers = []
-        ice_configs = getattr(self.opt, 'ice_servers', None)
-        if not ice_configs:
-            ice_configs = [{"urls": "stun:stun.freeswitch.org:3478"}]
+        ice_configs = getattr(self.opt, 'ice_servers', None) or []
 
         for cfg in ice_configs:
             if not isinstance(cfg, dict):
@@ -65,10 +67,6 @@ class RTCManager:
                 kwargs["credential"] = cfg["credential"]
             servers.append(RTCIceServer(**kwargs))
 
-        if not servers:
-            logger.warning("No valid ICE servers configured, fallback to default STUN")
-            servers = [RTCIceServer(urls="stun:stun.freeswitch.org:3478")]
-
         return servers
 
     async def _do_handle_offer(self, request):
@@ -83,8 +81,12 @@ class RTCManager:
                 text=json.dumps({"code": -1, "msg": "reach max session"}),
             )
 
-        # 通过 SessionManager 构建
-        sessionid = await session_manager.create_session(params)
+        # ── 阶段 1：创建会话（含形象冷加载，可能远超 30s）——独立超时 ──
+        session_timeout = getattr(self.opt, 'session_timeout', 120.0)
+        sessionid = await asyncio.wait_for(
+            session_manager.create_session(params),
+            timeout=session_timeout,
+        )
         webrtc_log.info(
             "offer received, creating session",
             extra={"sessionid": sessionid},
@@ -184,24 +186,11 @@ class RTCManager:
             transceiver = pc.getTransceivers()[1]
             transceiver.setCodecPreferences(preferences)
 
-            await pc.setRemoteDescription(offer)
-            webrtc_log.info("remote description set", extra={"sessionid": sessionid})
-
-            answer = await pc.createAnswer()
-            await pc.setLocalDescription(answer)
-            webrtc_log.info("local description set", extra={"sessionid": sessionid})
-
-            await asyncio.get_event_loop().run_in_executor(
-                None, log_resource_snapshot, "after_answer", sessionid
-            )
-
-            return web.Response(
-                content_type="application/json",
-                text=json.dumps({
-                    "sdp": pc.localDescription.sdp,
-                    "type": pc.localDescription.type,
-                    "sessionid": sessionid,
-                }),
+            # ── 阶段 2：SDP/ICE 协商——独立超时（不覆盖形象加载时间）──
+            offer_timeout = getattr(self.opt, 'offer_timeout', 30.0)
+            return await asyncio.wait_for(
+                self._negotiate(pc, offer, sessionid),
+                timeout=offer_timeout,
             )
         except Exception:
             webrtc_log.exception(
@@ -211,22 +200,48 @@ class RTCManager:
             await _cleanup_pc(pc, sessionid)
             raise
 
+    async def _negotiate(self, pc, offer, sessionid):
+        """SDP/ICE 协商阶段（setRemoteDescription → createAnswer → setLocalDescription）。
+
+        该阶段的耗时主要由 ICE 候选收集（setLocalDescription）决定，与外层
+        session_timeout 隔离，由 offer_timeout 单独限时。
+        """
+        await pc.setRemoteDescription(offer)
+        webrtc_log.info("remote description set", extra={"sessionid": sessionid})
+
+        answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+        webrtc_log.info("local description set", extra={"sessionid": sessionid})
+
+        await asyncio.get_event_loop().run_in_executor(
+            None, log_resource_snapshot, "after_answer", sessionid
+        )
+
+        return web.Response(
+            content_type="application/json",
+            text=json.dumps({
+                "sdp": pc.localDescription.sdp,
+                "type": pc.localDescription.type,
+                "sessionid": sessionid,
+            }),
+        )
+
     async def handle_offer(self, request):
-        """处理 WebRTC offer 信令，带超时保护。"""
-        timeout = getattr(self.opt, 'offer_timeout', 10.0)
+        """处理 WebRTC offer 信令。
+
+        两阶段各自限时（会话创建见 session_timeout，SDP/ICE 协商见 offer_timeout），
+        此处仅作薄壳，负责把阶段超时/异常映射为 HTTP 响应。
+        """
         try:
-            return await asyncio.wait_for(
-                self._do_handle_offer(request),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
-            logger.exception("handle_offer timeout after %ss", timeout)
+            return await self._do_handle_offer(request)
+        except asyncio.TimeoutError as e:
+            logger.exception("handle_offer timeout: %s", e)
             return web.Response(
                 status=504,
                 content_type="application/json",
                 text=json.dumps({
                     "code": -1,
-                    "msg": f"Server offer processing timeout ({timeout}s)",
+                    "msg": f"Server offer processing timeout: {e}",
                 }),
             )
         except Exception as e:

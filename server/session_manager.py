@@ -65,8 +65,10 @@ class SessionManager:
             )
             self.sessions[sessionid] = avatar_session
             return sessionid
-        except Exception:
-            # 构建失败时清理占位，避免留下 None 导致后续访问异常
+        except BaseException:
+            # 构建失败或超时取消时清理占位，避免留下 None 导致后续访问异常。
+            # 注意：asyncio.CancelledError（超时取消）继承自 BaseException，
+            # 普通 `except Exception` 抓不到，会残留占位导致 sessions 计数只增不减。
             logger.exception('Failed to create session %s', sessionid)
             self.sessions.pop(sessionid, None)
             raise
