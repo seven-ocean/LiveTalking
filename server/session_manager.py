@@ -29,6 +29,10 @@ class SessionManager:
         if not hasattr(self, "initialized"):
             self.sessions: Dict[str, BaseAvatar] = {}
             self.build_session_fn = None
+            # 会话租约（WS 降级通道用）：被租用的会话在 WebRTC pc 关闭时不销毁
+            self.leases: Dict[str, int] = {}
+            # pc 关闭时发现有租约 → 记下“待销毁”，等租约全部释放后再补做
+            self.pending_destroy: set = set()
             self.initialized = True
 
     def init_builder(self, build_session_fn):
@@ -94,6 +98,30 @@ class SessionManager:
         if sessionid in self.sessions:
             logger.info(f"Removing session {sessionid}")
             self.sessions.pop(sessionid, None)
+
+    # ─── 会话租约（WS 降级通道专用）──────────────────────────────────
+    def lease_session(self, sessionid: str):
+        """标记会话被外部（WS 降级通道）占用，期间 WebRTC pc 关闭不销毁该会话。"""
+        self.leases[sessionid] = self.leases.get(sessionid, 0) + 1
+
+    def is_leased(self, sessionid: str) -> bool:
+        return self.leases.get(sessionid, 0) > 0
+
+    def mark_pending_destroy(self, sessionid: str):
+        """pc 关闭时发现会话仍被租用，记录待销毁，待租约释放后再清理。"""
+        self.pending_destroy.add(sessionid)
+
+    def release_session(self, sessionid: str) -> bool:
+        """释放一次租约；返回 True 表示此前有被推迟的销毁需要调用方立刻执行。"""
+        cnt = self.leases.get(sessionid, 0)
+        if cnt > 1:
+            self.leases[sessionid] = cnt - 1
+            return False
+        self.leases.pop(sessionid, None)
+        if sessionid in self.pending_destroy:
+            self.pending_destroy.discard(sessionid)
+            return True
+        return False
 
 # 单例抛出
 session_manager = SessionManager()

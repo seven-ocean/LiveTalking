@@ -138,8 +138,17 @@ class RTCManager:
                     extra={"sessionid": sessionid},
                 )
             self.pcs.discard(pc)
-            session_manager.stop_session(sessionid)
-            session_manager.remove_session(sessionid)
+            # 若会话正被 WS 降级通道租用（复用同一会话），则推迟销毁，
+            # 避免 pc 因 ICE 失败关闭时把正在推送的会话一起杀掉。
+            if session_manager.is_leased(sessionid):
+                session_manager.mark_pending_destroy(sessionid)
+                webrtc_log.info(
+                    "session leased by ws fallback, defer destroy",
+                    extra={"sessionid": sessionid},
+                )
+            else:
+                session_manager.stop_session(sessionid)
+                session_manager.remove_session(sessionid)
             webrtc_log.info(
                 "pc cleanup completed",
                 extra={"sessionid": sessionid},
