@@ -48,6 +48,7 @@ import random
 import shutil
 import time
 import asyncio
+import importlib
 import torch
 import os
 from io import BytesIO
@@ -65,6 +66,17 @@ app = Flask(__name__)
 opt = None
 model = None
 global_avatars = {} # avatar_id: payload
+
+# ─── 模型运行时（单进程多模型）────────────────────────────────────
+# 模型名 -> 插件模块（从 main() 内提升到模块级，供懒加载复用）
+_AVATAR_MODULES = {
+    'musetalk':   'avatars.musetalk_avatar',
+    'wav2lip':    'avatars.wav2lip_avatar',
+    'ultralight': 'avatars.ultralight_avatar',
+}
+# 已就绪的模型运行时：model_name -> {"model": <weights>, "load_avatar": fn}
+_model_runtimes: Dict[str, dict] = {}
+_model_load_lock = Lock()  # 保证同一模型只加载一次（并发去重）
 
 # ─── avatar 加载状态注册表（线程安全）────────────────────────────────
 # avatar_id -> {"status": "loading"|"ready"|"error", "startedAt": float,
@@ -96,6 +108,76 @@ def _get_avatar_state(avatar_id: str) -> dict:
     with _avatar_state_lock:
         return dict(_avatar_state.get(avatar_id) or {})
 
+def resolve_avatar_model(avatar_id: str) -> str:
+    """解析形象所属模型：优先 avatar.json.model，其次按目录内容推断，最后回退 opt.model。"""
+    avatar_dir = os.path.join('data', 'avatars', avatar_id)
+    meta_file = os.path.join(avatar_dir, 'avatar.json')
+    if os.path.exists(meta_file):
+        try:
+            with open(meta_file, 'r', encoding='utf-8') as f:
+                m = (json.load(f) or {}).get('model')
+            if m:
+                return m
+        except Exception:
+            logger.warning("读取形象元信息失败，回退目录推断: %s", meta_file)
+    # 目录内容推断（兼容仅 avator_info.json / 命令行创建的历史形象）
+    if os.path.exists(os.path.join(avatar_dir, 'latents.pt')) or \
+       os.path.isdir(os.path.join(avatar_dir, 'mask')):
+        return 'musetalk'
+    if os.path.isdir(os.path.join(avatar_dir, 'face_imgs')):
+        return 'wav2lip'
+    return opt.model
+
+def _resolve_onnx_paths(model_name: str, opt):
+    """按模型解析 ONNX 路径（避免多模型共用单一 opt.onnx_model_path 而相互覆盖）。"""
+    onnx_path = getattr(opt, 'onnx_model_path', None)
+    vae_path = getattr(opt, 'vae_onnx_path', None)
+    if getattr(opt, 'use_onnx', False) and not onnx_path:
+        if model_name == 'musetalk':
+            onnx_path = './models/onnx/musetalk/unet.onnx'
+            vae_path = './models/onnx/musetalk/vae_decoder.onnx'
+        elif model_name == 'wav2lip':
+            onnx_path = './models/onnx/wav2lip/wav2lip.onnx'
+    return onnx_path, vae_path
+
+def _load_model_weights(model_name: str, avatar_mod, opt):
+    """加载指定模型权重（迁移自原 main() 的 if/elif 分支）。"""
+    onnx_path, vae_path = _resolve_onnx_paths(model_name, opt)
+    if model_name == 'musetalk':
+        if getattr(opt, 'use_onnx', False):
+            return avatar_mod.load_onnx_model(onnx_path, vae_path)
+        return avatar_mod.load_model()
+    if model_name == 'wav2lip':
+        if getattr(opt, 'use_onnx', False):
+            return avatar_mod.load_onnx_model(onnx_path)
+        return avatar_mod.load_model("./models/wav2lip/wav2lip.pth")
+    # ultralight
+    return avatar_mod.load_model(opt)
+
+def ensure_model_runtime(model_name: str) -> dict:
+    """确保某模型的权重与 load_avatar 就绪（懒加载 + 常驻缓存，并发去重）。"""
+    rt = _model_runtimes.get(model_name)
+    if rt is not None:
+        return rt
+    with _model_load_lock:
+        rt = _model_runtimes.get(model_name)
+        if rt is not None:
+            return rt
+        if model_name not in _AVATAR_MODULES:
+            raise ValueError(f"未知模型: {model_name}")
+        avatar_mod = importlib.import_module(_AVATAR_MODULES[model_name])
+        logger.info("懒加载模型运行时: %s", model_name)
+        weights = _load_model_weights(model_name, avatar_mod, opt)
+        # warm_up 签名各模型不同；ultralight 的 warm_up 依赖形象数据，延后到 main() 处理（保持原行为）
+        if model_name == 'wav2lip':
+            avatar_mod.warm_up(opt.batch_size, weights, 256)
+        elif model_name == 'musetalk':
+            avatar_mod.warm_up(opt.batch_size, weights)
+        rt = {"model": weights, "load_avatar": avatar_mod.load_avatar}
+        _model_runtimes[model_name] = rt
+        logger.info("模型运行时就绪: %s", model_name)
+        return rt
+
 def get_or_load_avatar(avatar_id: str):
     """获取 avatar（缓存优先）；未缓存则加载。
 
@@ -110,10 +192,12 @@ def get_or_load_avatar(avatar_id: str):
         if cached is not None:
             return cached
         started = time.time()
+        model_name = resolve_avatar_model(avatar_id)
         _update_avatar_state(avatar_id, status="loading", startedAt=started,
-                             elapsedMs=None, error=None)
+                             elapsedMs=None, error=None, model=model_name)
         try:
-            avatar = load_avatar(avatar_id)
+            rt = ensure_model_runtime(model_name)
+            avatar = rt["load_avatar"](avatar_id)
             global_avatars[avatar_id] = avatar
             _update_avatar_state(avatar_id, status="ready",
                                  elapsedMs=int((time.time() - started) * 1000))
@@ -156,16 +240,17 @@ def build_avatar_session(sessionid:str, params:dict)->BaseAvatar:
     opt_this = copy.deepcopy(opt)
     opt_this.sessionid = sessionid
 
-    avatar_id = params.get('avatar',opt.avatar_id) 
+    avatar_id = params.get('avatar',opt.avatar_id)
     opt_this.avatar_id = avatar_id
     ref_audio = params.get('refaudio','') #音色
     ref_text = params.get('reftext','')
-    if (avatar_id and avatar_id != opt.avatar_id):
-        # 缓存优先，未缓存则冷加载（与 /warmup 共用同一去重逻辑）
-        avatar_this = get_or_load_avatar(avatar_id)
-    else:
-        # Default avatar loaded at startup
-        avatar_this = global_avatars.get(opt.avatar_id)
+
+    # 按形象解析其真实模型，并用该模型的权重/loader 构建会话（支持单进程跨模型）
+    model_name = resolve_avatar_model(avatar_id)
+    rt = ensure_model_runtime(model_name)
+    # 缓存优先，未缓存则冷加载（与 /warmup 共用同一去重逻辑）
+    avatar_this = get_or_load_avatar(avatar_id)
+
     if ref_audio: #请求参数配置了参考音频
         opt_this.REF_FILE = ref_audio
         opt_this.REF_TEXT = ref_text
@@ -173,7 +258,8 @@ def build_avatar_session(sessionid:str, params:dict)->BaseAvatar:
     if custom_config:
         opt_this.customopt = json.loads(custom_config)
 
-    avatar_session = registry.create("avatar", opt.model, opt=opt_this, model=model, avatar=avatar_this)
+    opt_this.model = model_name  # 会话记录真实模型（供 /admin 状态等使用）
+    avatar_session = registry.create("avatar", model_name, opt=opt_this, model=rt["model"], avatar=avatar_this)
     return avatar_session
 
 async def offer(request):
@@ -197,8 +283,12 @@ async def warmup_status(request):
     """
     avatar_id = request.query.get('avatar') or opt.avatar_id
     if global_avatars.get(avatar_id) is not None:
+        st_ready = _get_avatar_state(avatar_id)
+        resp_ready = {"code": 0, "status": "ready"}
+        if st_ready.get("model"):
+            resp_ready["model"] = st_ready["model"]
         return web.Response(content_type="application/json",
-                            text=json.dumps({"code": 0, "status": "ready"}))
+                            text=json.dumps(resp_ready))
     st = _get_avatar_state(avatar_id)
     if not st:
         # 未触发过预热：顺手触发，避免调用方轮询死等
@@ -209,6 +299,8 @@ async def warmup_status(request):
         "status": st.get("status") or "loading",
         "elapsedMs": st.get("elapsedMs"),
     }
+    if st.get("model"):
+        resp["model"] = st["model"]
     if st.get("error"):
         resp["error"] = st["error"]
     return web.Response(content_type="application/json", text=json.dumps(resp))
@@ -248,17 +340,6 @@ def main():
         lb_main(opt)
         return
 
-    # ─── 加载 avatar 插件（触发 @register 注册）──────────────────────
-    _avatar_modules = {
-        'musetalk':   'avatars.musetalk_avatar',
-        'wav2lip':    'avatars.wav2lip_avatar',
-        'ultralight': 'avatars.ultralight_avatar',
-    }
-    import importlib
-    avatar_mod = importlib.import_module(_avatar_modules[opt.model])
-    load_model = avatar_mod.load_model
-    load_avatar = avatar_mod.load_avatar
-    warm_up = avatar_mod.warm_up
     logger.info(opt)
 
     # ─── 启动授权校验（license_check，默认关闭）────────────────────
@@ -266,45 +347,20 @@ def main():
     from license_check import run_license_check
     run_license_check(opt)
 
-    # 自动设置默认 ONNX 路径
-    if opt.use_onnx and not opt.onnx_model_path:
-        if opt.model == 'musetalk':
-            opt.onnx_model_path = './models/onnx/musetalk/unet.onnx'
-            opt.vae_onnx_path = './models/onnx/musetalk/vae_decoder.onnx'
-        elif opt.model == 'wav2lip':
-            opt.onnx_model_path = './models/onnx/wav2lip/wav2lip.onnx'
-        logger.info(f"Auto-selected ONNX model path: {opt.onnx_model_path}")
+    # ─── 加载主模型运行时（触发 @register 注册 + 权重加载）──────────
+    # 启动只加载 opt.model 一套权重（与现状启动开销一致）；其它模型在
+    # /offer 或 /warmup 首次用到时按形象懒加载并常驻（见 ensure_model_runtime）。
+    rt = ensure_model_runtime(opt.model)
+    model = rt["model"]                 # 兼容旧全局引用
+    load_avatar = rt["load_avatar"]     # 兼容旧全局引用
 
-    if opt.model == 'musetalk':
-        if opt.use_onnx:
-            # 使用 ONNX 模型
-            from avatars.musetalk_avatar import load_onnx_model
-            # 检查 VAE ONNX 是否存在，如果存在则一起加载
-            vae_onnx_path = getattr(opt, 'vae_onnx_path', None)
-            model = load_onnx_model(opt.onnx_model_path, vae_onnx_path)
-            logger.info(f"Using MuseTalk ONNX model: {opt.onnx_model_path}")
-            if vae_onnx_path and os.path.exists(vae_onnx_path):
-                logger.info(f"Using MuseTalk VAE ONNX model: {vae_onnx_path}")
-        else:
-            # 使用 PyTorch 模型
-            model = load_model()
-        global_avatars[opt.avatar_id] = load_avatar(opt.avatar_id) 
-        warm_up(opt.batch_size,model)      
-    elif opt.model == 'wav2lip':
-        if opt.use_onnx:
-            # 使用 ONNX 模型
-            from avatars.wav2lip_avatar import load_onnx_model
-            model = load_onnx_model(opt.onnx_model_path)
-            logger.info(f"Using Wav2Lip ONNX model: {opt.onnx_model_path}")
-        else:
-            # 使用 PyTorch 模型
-            model = load_model("./models/wav2lip/wav2lip.pth")
-        global_avatars[opt.avatar_id] = load_avatar(opt.avatar_id)
-        warm_up(opt.batch_size,model,256)
-    elif opt.model == 'ultralight':
-        model = load_model(opt)
-        global_avatars[opt.avatar_id] = load_avatar(opt.avatar_id)
-        warm_up(opt.batch_size,global_avatars[opt.avatar_id],160)
+    # 预加载默认形象（缓存优先，内部按形象解析模型）
+    get_or_load_avatar(opt.avatar_id)
+
+    # ultralight 的 warm_up 依赖形象数据，载入默认形象后预热（保持原行为）
+    if opt.model == 'ultralight':
+        _ul = importlib.import_module(_AVATAR_MODULES['ultralight'])
+        _ul.warm_up(opt.batch_size, global_avatars[opt.avatar_id], 160)
 
     # init rtc manager
     session_manager.init_builder(build_avatar_session)

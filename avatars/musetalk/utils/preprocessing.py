@@ -7,21 +7,18 @@ import cv2
 import pickle
 import os
 import json
-# from mmpose.apis import inference_topdown, init_model
-# from mmpose.structures import merge_data_samples
-import face_recognition
+import face_alignment
 import torch
 from tqdm import tqdm
-
-# initialize the mmpose model
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-config_file = './avatars/musetalk/utils/dwpose/rtmpose-l_8xb32-270e_coco-ubody-wholebody-384x288.py'
-checkpoint_file = './models/musetalk/dwpose/dw-ll_ucoco_384.pth'
-model = init_model(config_file, checkpoint_file, device=device)
 
 # initialize the face detection model
 device = "cuda" if torch.cuda.is_available() else "cpu"
 fa = FaceAlignment(LandmarksType._2D, flip_input=False,device=device)
+
+# 68 点关键点：用已安装的 face_alignment(FAN) 替代缺失的 face_recognition/dlib
+fa_landmark = face_alignment.FaceAlignment(
+    face_alignment.LandmarksType.TWO_D, flip_input=False, device=device, compile=False
+)
 
 # maker if the bbox is not sufficient 
 coord_placeholder = (0.0,0.0,0.0,0.0)
@@ -101,21 +98,10 @@ def get_landmark_and_bbox(img_list,upperbondrange =0):
         # face_land_mark= keypoints[0][23:91]
         # face_land_mark = face_land_mark.astype(np.int32)
         img_rgb = cv2.cvtColor(np.asarray(fb)[0], cv2.COLOR_BGR2RGB)
-        landmarks_list = face_recognition.face_landmarks(img_rgb)
+        landmarks_list = fa_landmark.get_landmarks_from_image(img_rgb)
         if landmarks_list:
-            lm = landmarks_list[0]
-            # Reconstruct the full 68-point dlib landmark array
-            face_land_mark = np.array(
-                lm['chin'] +
-                lm['left_eyebrow'] +
-                lm['right_eyebrow'] +
-                lm['nose_bridge'] +
-                lm['nose_tip'] +
-                lm['left_eye'] +
-                lm['right_eye'] +
-                lm['top_lip'] +
-                lm['bottom_lip']
-            ).astype(np.int32)
+            # face_alignment(FAN) 输出 68 点，索引与 dlib/iBUG 一致
+            face_land_mark = np.asarray(landmarks_list[0]).astype(np.int32)
         else:
             face_land_mark = np.zeros((68, 2), dtype=np.int32)
         
