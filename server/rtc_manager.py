@@ -6,6 +6,7 @@ import json
 import asyncio
 import random
 import copy
+import time
 from typing import Dict, Optional, List
 import queue
 
@@ -42,6 +43,44 @@ class RTCManager:
         """
         self.opt = opt
         self.pcs: set = set()
+
+    # pc 判定为「仍在尝试连接」的宽限期：超过它还没 connected，就认为是死连接。
+    # 依据：ICE 连不上时 aiortc 的 connectionState 会**长期停在 connecting/checking**、
+    # 永不变成 failed，若只按 failed/closed 判定，泄漏的会话与 pc 永远不会被回收（实测）。
+    PC_CONNECT_GRACE_SECONDS = 60
+
+    def session_has_live_pc(self, sessionid: str, require_connected: bool = False) -> bool:
+        """该会话是否还有一个"活着"的 pc。
+
+        默认（require_connected=False）：已 connected，或创建不满宽限期（还在尝试连）。
+        require_connected=True：只有**真的连上了**才算活 —— 用于 WS 断开时的回收判定：
+        前端只在 WebRTC 连不上时才启用 WS 降级通道，所以「WS 曾连上」本身就意味着
+        这条 pc 是连不通的死连接，无需再等宽限期，可立即销毁会话。
+        """
+        now = time.time()
+        for pc in list(self.pcs):
+            if getattr(pc, '_zl_sessionid', None) != sessionid:
+                continue
+            state = getattr(pc, 'connectionState', 'closed')
+            if state == 'connected':
+                return True
+            if require_connected or state in ('failed', 'closed'):
+                continue
+            created = getattr(pc, '_zl_created', 0)
+            if now - created < self.PC_CONNECT_GRACE_SECONDS:
+                return True
+        return False
+
+    async def drop_session_pcs(self, sessionid: str) -> None:
+        """会话被回收时，把它留下的死 pc 一并关掉释放资源。"""
+        for pc in list(self.pcs):
+            if getattr(pc, '_zl_sessionid', None) != sessionid:
+                continue
+            self.pcs.discard(pc)
+            try:
+                await pc.close()
+            except Exception:
+                pass
 
     def _build_ice_servers(self) -> List[RTCIceServer]:
         """根据配置构建 RTCIceServer 列表，支持 STUN/TURN。
@@ -108,6 +147,12 @@ class RTCManager:
         pc = RTCPeerConnection(
             configuration=RTCConfiguration(iceServers=ice_servers)
         )
+        # 标记归属会话，供会话回收判定（见 session_has_live_pc）
+        try:
+            pc._zl_sessionid = sessionid
+            pc._zl_created = time.time()
+        except Exception:
+            pass
         self.pcs.add(pc)
 
         # 防止状态变更时重复触发清理

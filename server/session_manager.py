@@ -3,6 +3,7 @@
 ###############################################################################
 
 import asyncio
+import time
 import uuid
 from typing import Dict, Optional
 from utils.logger import logger
@@ -33,7 +34,18 @@ class SessionManager:
             self.leases: Dict[str, int] = {}
             # pc 关闭时发现有租约 → 记下“待销毁”，等租约全部释放后再补做
             self.pending_destroy: set = set()
+            # 最近活跃时间（按会话）：供空闲回收兜底（见 app.py 的会话回收任务）
+            self.last_active: Dict[str, float] = {}
             self.initialized = True
+
+    def touch(self, sessionid: str) -> None:
+        """标记会话有活跃使用（收到 /offer、/human、/humanaudio、WS 连接等）。"""
+        if sessionid:
+            self.last_active[sessionid] = time.time()
+
+    def idle_seconds(self, sessionid: str) -> float:
+        ts = self.last_active.get(sessionid)
+        return time.time() - ts if ts else float('inf')
 
     def init_builder(self, build_session_fn):
         """配置用于构建 avatar_session 的工厂函数"""
@@ -61,6 +73,7 @@ class SessionManager:
         logger.info('Creating sessionid=%s, current session num=%d', sessionid, len(self.sessions))
         # 预先占位防止重复
         self.sessions[sessionid] = None
+        self.touch(sessionid)
 
         try:
             # 在线程池中构建 session（加载模型非常耗时）
@@ -98,6 +111,9 @@ class SessionManager:
         if sessionid in self.sessions:
             logger.info(f"Removing session {sessionid}")
             self.sessions.pop(sessionid, None)
+        self.last_active.pop(sessionid, None)
+        self.leases.pop(sessionid, None)
+        self.pending_destroy.discard(sessionid)
 
     # ─── 会话租约（WS 降级通道专用）──────────────────────────────────
     def lease_session(self, sessionid: str):

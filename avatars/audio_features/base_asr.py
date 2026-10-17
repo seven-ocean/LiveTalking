@@ -43,9 +43,22 @@ class BaseASR:
         self.stride_left_size = opt.l
         self.stride_right_size = opt.r
         #self.context_size = 10
-        self.feat_queue = Queue(maxsize=2)
+        # 注意：这里**不能**限制容量。原为 maxsize=2，当渲染线程（生产者）塞满时会在
+        # put 上阻塞，而推理线程（消费者）此时正阻塞在 output_queue.get() 上等音频帧
+        # → 双方互等、整条管线卡死（实测连接后约 2 秒就断流、黑屏）。
+        # 生产侧本身已被静音时钟节流（每 chunk 一个 20ms 等待），无需再用队列做背压。
+        self.feat_queue = Queue()
 
         #self.warm_up()
+
+    def resolve_feat_batch(self, payload):
+        """把 feat_queue 取出的负载解析成「本轮的口型特征批次」。
+
+        默认（mel 路径）负载本身就是特征批次，原样返回；
+        MuseTalk 的 Whisper 路径把前向计算推迟到这里（见 whisper.py），
+        让消费端在确认「本轮确实在说话」之后才付出算力 —— 待机全静音时一次都不跑。
+        """
+        return payload
 
     def flush_talk(self):
         self.queue.queue.clear()

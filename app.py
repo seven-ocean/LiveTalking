@@ -382,6 +382,45 @@ def main():
     appasync["rtc_manager"] = rtc_manager
 
     appasync.on_shutdown.append(on_shutdown)
+
+    # ─── 空闲会话回收（兜底）────────────────────────────────────────
+    # ICE 卡在 checking 时 pc 永不 failed → 「pc 失败即清理」不触发，浏览器异常退出
+    # （标签页崩溃/断网/直接关掉）时 WS 断开路径也可能走不到，会话就会一直挂着占内存。
+    # 这里每 30s 扫一遍：既无 WS 租约、又无活着 pc、且超时无活跃 → 销毁。
+    _REAP_INTERVAL = 30
+    _REAP_IDLE_SECONDS = 120
+
+    async def _session_reaper():
+        while True:
+            await asyncio.sleep(_REAP_INTERVAL)
+            try:
+                for sid in list(session_manager.sessions.keys()):
+                    if session_manager.is_leased(sid):
+                        continue          # WS 降级通道还连着
+                    try:
+                        if rtc_manager.session_has_live_pc(sid):
+                            continue      # WebRTC 还在用
+                    except Exception:
+                        continue
+                    if session_manager.idle_seconds(sid) > _REAP_IDLE_SECONDS:
+                        logger.info("会话回收：销毁空闲会话 sessionid=%s（无租约、无活 pc、空闲 %.0fs）",
+                                    sid, session_manager.idle_seconds(sid))
+                        session_manager.stop_session(sid)
+                        session_manager.remove_session(sid)
+            except Exception:
+                logger.exception("session reaper error")
+
+    async def _start_reaper(app):
+        app["_reaper_task"] = asyncio.ensure_future(_session_reaper())
+
+    async def _stop_reaper(app):
+        task = app.get("_reaper_task")
+        if task is not None:
+            task.cancel()
+
+    appasync.on_startup.append(_start_reaper)
+    appasync.on_shutdown.append(_stop_reaper)
+
     appasync.router.add_post("/offer", offer)
     appasync.router.add_get("/record/{sessionid}", download_record)
     appasync.router.add_post("/warmup", warmup_avatar)

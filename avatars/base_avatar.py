@@ -426,18 +426,23 @@ class BaseAvatar:
                     is_all_silence = False               
                 audio_frames.append(audioframe)
 
-            # 防御：检测 mel 特征 batch size 是否匹配，防止 flush_talk 后
-            # feat_queue/output_queue 清空不彻底导致 ONNX shape mismatch 崩溃
-            if len(audiofeat_batch) != self.batch_size:
-                logger.warning(f'[WARN] audio feat batch size mismatch: got {len(audiofeat_batch)}, expected {self.batch_size}. Treating as silence.')
-                # 强制所有音频帧为静音类型，确保 process_frames 走静音分支而非 paste_back_frame
-                for af in audio_frames:
-                    af.type = 1
-                for i in range(self.batch_size):
-                    idx = mirror_index(length, index)
-                    self.res_frame_queue.put((None, audio_frames[i*2:i*2+2], idx))
-                    index = index + 1
-                continue
+            # 只有「本轮确实在说话」才需要口型特征；静音轮次直接走静态帧分支。
+            # MuseTalk 的 Whisper 前向正是在这一步（resolve_feat_batch）才真正执行，
+            # 所以待机时一次前向都不会跑。
+            if not is_all_silence:
+                try:
+                    audiofeat_batch = self.asr.resolve_feat_batch(audiofeat_batch)
+                except Exception:
+                    logger.exception('resolve feat batch failed, treating as silence')
+                    audiofeat_batch = None
+                # 防御：特征批次不匹配（或解析失败）时按静音处理，防止 flush_talk 后
+                # feat_queue/output_queue 清空不彻底导致 shape mismatch 崩溃
+                if audiofeat_batch is None or len(audiofeat_batch) != self.batch_size:
+                    _got = None if audiofeat_batch is None else len(audiofeat_batch)
+                    logger.warning(f'[WARN] audio feat batch size mismatch: got {_got}, expected {self.batch_size}. Treating as silence.')
+                    for af in audio_frames:
+                        af.type = 1
+                    is_all_silence = True
 
              # 检测状态变化
             current_speaking = not is_all_silence
@@ -574,22 +579,28 @@ class BaseAvatar:
         totaltime=0
         _starttime=time.perf_counter()
         _totalframe=0
+        # 一轮产出 batch_size 帧，对应 batch_size/fps 秒视频 → 这是产出的时间节拍
+        _round_interval = self.batch_size / float(self.asr.fps or 25)
+        _deadline = time.monotonic()
         while not quit_event.is_set():
             t = time.perf_counter()
             self.asr.run_step()
             if quit_event.is_set():
                 break
 
-            buffer_size = self.output.get_buffer_size() if hasattr(self.output, 'get_buffer_size') else 0
-            if buffer_size >= 5:
-                logger.debug('sleep qsize=%d', buffer_size)
-                # 将长 sleep 拆分为短步，便于快速响应 quit_event
-                sleep_total = 0.04 * buffer_size * 0.8
-                sleep_step = 0.05
-                slept = 0.0
-                while slept < sleep_total and not quit_event.is_set():
-                    time.sleep(min(sleep_step, sleep_total - slept))
-                    slept += sleep_step
+            # 产出节拍：一轮 = batch_size 帧 = batch_size/fps 秒的视频（25fps、batch16 → 640ms）。
+            # 必须按**时间**节流而不是按 RTP 队列深度：ICE 未连通时（真实环境降级到 WS 就是这个
+            # 状态）RTP 队列没有消费者、恒满，按队列深度会白睡数秒 → 产出掉到 5fps 且成突发。
+            _deadline += _round_interval
+            _now = time.monotonic()
+            if _deadline > _now:
+                while not quit_event.is_set():
+                    _left = _deadline - time.monotonic()
+                    if _left <= 0:
+                        break
+                    time.sleep(min(0.05, _left))
+            else:
+                _deadline = _now  # 落后则重新对齐，避免越睡越慢
         logger.info('baseavatar render thread stop')
 
         infer_quit_event.set()
