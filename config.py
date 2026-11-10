@@ -50,6 +50,32 @@ def parse_args():
                         help="use ONNX model instead of PyTorch (default: False)")
     parser.add_argument('--onnx_model_path', type=str, default='',
                         help="path to ONNX model file (default: auto-select based on --model)")
+    parser.add_argument('--use_trt', action='store_true',
+                        help="用 TensorRT 加速 ONNX 推理（wav2lip 与超分；需装 tensorrt-cu12）。"
+                             "首次启动构建引擎约 1~2 分钟/模型，之后走 models/onnx/trt_cache 缓存；"
+                             "不可用或构建失败时自动回退 CUDAExecutionProvider")
+    parser.add_argument('--trt_cache_dir', type=str, default='./models/onnx/trt_cache',
+                        help="TensorRT 引擎缓存目录（默认 ./models/onnx/trt_cache；删除可强制重建）")
+    parser.add_argument('--trt_fp16', action='store_true',
+                        help="wav2lip 的 TensorRT 用 fp16（更快；实测输出偏差 max≈0.002，肉眼不可见）。"
+                             "超分 GFPGAN 固定 fp32，fp16 会明显掉画质")
+
+    # ─── 人脸超分/复原 ────────────────────────────────────────────────
+    parser.add_argument('--use_sr', action='store_true',
+                        help="对人脸做超分/复原（GFPGANv1.4），默认关闭；只跑 GPU")
+    parser.add_argument('--sr_model_path', type=str,
+                        default='./models/onnx/gfpgan/GFPGANv1.4.onnx',
+                        help="超分 ONNX 模型路径（--sr_backend=onnx 时使用）")
+    parser.add_argument('--sr_pt_model_path', type=str,
+                        default='./models/common/gfpgan/GFPGANv1.4.pth',
+                        help="超分 PyTorch 权重路径（--sr_backend=torch 时使用）")
+    parser.add_argument('--sr_backend', type=str, default='auto',
+                        choices=['auto', 'onnx', 'torch'],
+                        help="超分推理后端：auto（默认，跟随 --use_onnx）/ onnx / torch")
+    parser.add_argument('--sr_allow_cpu', action='store_true',
+                        help="允许超分回退 CPU（默认禁止：拿不到 GPU 时直接关闭超分，避免拖慢推理）")
+    parser.add_argument('--sr_strength', type=float, default=0.6,
+                        help="超分强度 0~1：0=原图、1=GFPGAN 全量输出，默认 0.6（可运行时通过 /api/sr/config 调整）")
 
     # ─── 自定义动作和多形象 ────────────────────────────────────────────
     parser.add_argument('--customvideo_config', type=str, default='',
@@ -112,6 +138,13 @@ def parse_args():
         default='DEBUG',
         choices=['DEBUG', 'INFO', 'WARNING', 'WARN', 'ERROR', 'CRITICAL'],
         help="WebRTC 专用日志级别，默认 DEBUG",
+    )
+    parser.add_argument(
+        '--video_bitrate',
+        type=int,
+        default=6000000,
+        help="WebRTC 视频目标码率（bps），默认 6000000（6 Mbps）。"
+             "aiortc 默认仅 1 Mbps，会在首帧发虚，故创建编码器后立即抬高",
     )
 
     # ─── 授权加固（批次 4）─────────────────────────────────────────────

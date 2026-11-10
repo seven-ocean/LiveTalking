@@ -240,6 +240,31 @@ class HumanPlayer:
         if hasattr(self.__container, 'output'):
             self.__container.output._player = self
 
+        # 视频 RTP 发送器（由 RTCManager 在 addTrack 后挂接）：用于丢帧后请求关键帧
+        self.__video_sender = None
+        self.__last_keyframe_req = 0.0
+
+    def attach_video_sender(self, sender) -> None:
+        """记录视频 RTCRtpSender，供 push_video 丢帧时请求关键帧。"""
+        self.__video_sender = sender
+
+    def _request_keyframe(self):
+        """丢帧已打断帧间预测 → 请求下一个关键帧，避免画面脏到下一个自然 I 帧。
+
+        1s 节流：队列拥塞时不会每帧都请求（频繁 I 帧反而更吃带宽）。
+        """
+        sender = self.__video_sender
+        if sender is None:
+            return
+        now = time.time()
+        if now - self.__last_keyframe_req < 1.0:
+            return
+        self.__last_keyframe_req = now
+        try:
+            sender._send_keyframe()
+        except Exception:
+            mylogger.debug('request keyframe failed', exc_info=True)
+
     def push_video(self, frame):
         from av import VideoFrame
         new_frame = VideoFrame.from_ndarray(frame, format="bgr24")
@@ -247,9 +272,11 @@ class HumanPlayer:
         # 一旦写满（maxsize=100）`put` 就会阻塞 → process_frames/inference 全部被卡死
         # → 整条渲染管线停在几十帧后不再出画面（实测黑屏的根因）。
         # 所以这里必须丢最旧帧而不是阻塞；WS 通道有自己独立的队列，不受影响。
+        dropped = False
         try:
             self.__video._queue.put_nowait((new_frame, None))
         except queue.Full:
+            dropped = True
             try:
                 self.__video._queue.get_nowait()
             except queue.Empty:
@@ -258,6 +285,8 @@ class HumanPlayer:
                 self.__video._queue.put_nowait((new_frame, None))
             except queue.Full:
                 pass
+        if dropped:
+            self._request_keyframe()
         # 额外复制一份给 WS 降级通道（同一对象引用，开销可忽略）
         self.__ws_video.put(new_frame)
 

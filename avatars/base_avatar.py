@@ -47,12 +47,16 @@ from fractions import Fraction
 
 from utils.logger import logger
 from utils.image import read_imgs,mirror_index
+from avatars.sr.face_restorer import get_face_restorer
 
 # class State(Enum):
 #     INIT=0
 #     WAIT=1
 #     QUESTION=2
 #     ANSWER=3
+
+# 待机帧超分缓存条数上限（每条约 bbox 面积 × 3 字节，1080p 人像通常 < 1MB）
+SR_IDLE_CACHE_MAX = 200
 
 @dataclass
 class AudioFrameData:
@@ -66,6 +70,9 @@ class BaseAvatar:
         self.sample_rate = 16000
         self.chunk = self.sample_rate // (opt.fps*2) # 320 samples per chunk (20ms)
         self.sessionid = self.opt.sessionid
+        self.sr = get_face_restorer(opt)  # 人脸超分/复原；None = 未开启或初始化失败
+        self._sr_idle_cache = {}  # 待机帧 bbox 增强结果缓存：idx -> ndarray
+        self._sr_cache_strength = None  # 缓存对应的超分强度；强度变化时缓存失效
 
         self.speaking = False
         self.recording = False
@@ -474,6 +481,50 @@ class BaseAvatar:
                 last_speaking = current_speaking         
         logger.info('baseavatar inference thread stop')
 
+    def apply_sr_to_frame(self, frame, idx):
+        """待机（静音）帧超分：只增强 bbox 内的人脸区域再贴回。
+
+        待机帧来自固定循环视频（frame_list_cycle[idx] 恒定），且 GFPGAN 的噪声已固定为 0，
+        同一 idx 的增强结果完全一致 → 按 idx 缓存 bbox 结果，从第二轮起待机零推理开销。
+
+        未开启超分、无坐标数据或 bbox 异常时原样返回。
+        """
+        if self.sr is None:
+            return frame
+        coord_list = getattr(self, 'coord_list_cycle', None)
+        frame_list = getattr(self, 'frame_list_cycle', None)
+        if not coord_list or not frame_list or idx >= min(len(coord_list), len(frame_list)):
+            return frame
+
+        y1, y2, x1, x2 = coord_list[idx]
+        h, w = frame.shape[:2]
+        y1, y2 = max(0, int(y1)), min(h, int(y2))
+        x1, x2 = max(0, int(x1)), min(w, int(x2))
+        if y2 - y1 < 16 or x2 - x1 < 16:
+            return frame
+
+        cache = self._sr_idle_cache
+        # 运行时调整超分强度后，旧缓存（按旧强度生成）必须整体失效，否则画面会「回到旧强度」
+        strength = getattr(self.sr, 'strength', None)
+        if strength != self._sr_cache_strength:
+            cache.clear()
+            self._sr_cache_strength = strength
+
+        face = cache.get(idx)
+        if face is None:
+            face = self.sr.enhance(frame[y1:y2, x1:x2])
+            if len(cache) >= SR_IDLE_CACHE_MAX:
+                cache.clear()  # 形象帧数超上限时整体丢弃重算，避免无限占用内存
+            cache[idx] = face
+
+        out = frame.copy()
+        out[y1:y2, x1:x2] = face
+        return out
+
+    def apply_silent_frame(self, frame, idx):
+        """静音时输出的帧；子类可覆盖（例如把嘴部合成成闭嘴状态，避免露出底视频的笑口型）。"""
+        return self.apply_sr_to_frame(frame, idx)
+
     def process_frames(self,quit_event):
         enable_transition = False  # 设置为False禁用过渡效果，True启用
         
@@ -509,6 +560,7 @@ class BaseAvatar:
                     self.custom_index[audiotype] += 1
                 else:
                     target_frame = self.frame_list_cycle[idx]
+                    target_frame = self.apply_silent_frame(target_frame, idx)
                 
                 if enable_transition:
                     # 说话→静音过渡

@@ -21,6 +21,20 @@ from utils.hardware_monitor import log_resource_snapshot
 webrtc_log = get_webrtc_logger()
 
 
+def _raise_encoder_bitrate_cap(bitrate: int) -> None:
+    """放宽 aiortc 编码器的码率上限。
+
+    aiortc 对 target_bitrate 做了硬裁剪（H264 3 Mbps、VP8 1.5 Mbps），
+    不放开的话即使设了 --video_bitrate=6000000 也会被打回 3 Mbps。
+    """
+    from aiortc.codecs import h264 as _h264
+    from aiortc.codecs import vpx as _vpx
+
+    for mod in (_h264, _vpx):
+        if getattr(mod, 'MAX_BITRATE', 0) < bitrate:
+            mod.MAX_BITRATE = int(bitrate)
+
+
 # def _rand_session_id(n: int = 6) -> int:
 #     """生成 N 位随机 session ID"""
 #     return random.randint(10 ** (n - 1), 10 ** n - 1)
@@ -43,6 +57,10 @@ class RTCManager:
         """
         self.opt = opt
         self.pcs: set = set()
+        try:
+            _raise_encoder_bitrate_cap(int(getattr(opt, 'video_bitrate', 0) or 0))
+        except Exception:
+            webrtc_log.exception("raise encoder bitrate cap failed")
 
     # pc 判定为「仍在尝试连接」的宽限期：超过它还没 connected，就认为是死连接。
     # 依据：ICE 连不上时 aiortc 的 connectionState 会**长期停在 connecting/checking**、
@@ -232,6 +250,15 @@ class RTCManager:
             pc.addTrack(player.audio)
             pc.addTrack(player.video)
 
+            # 视频发送器：丢帧时请求关键帧 + 初始码率（aiortc 默认仅 1 Mbps，首帧会发虚）
+            video_senders = [s for s in pc.getSenders() if s.kind == 'video']
+            if video_senders:
+                video_sender = video_senders[0]
+                player.attach_video_sender(video_sender)
+                asyncio.create_task(
+                    self._apply_initial_bitrate(video_sender, sessionid)
+                )
+
             # 设置编解码器偏好
             capabilities = RTCRtpSender.getCapabilities("video")
             preferences = list(filter(lambda x: x.name == "H264", capabilities.codecs))
@@ -253,6 +280,34 @@ class RTCManager:
             )
             await _cleanup_pc(pc, sessionid)
             raise
+
+    async def _apply_initial_bitrate(self, sender, sessionid):
+        """编码器在首帧才创建；一旦出现就把目标码率抬到 --video_bitrate。
+
+        aiortc 默认只有 1 Mbps 且依赖浏览器 REMB 慢慢爬升，所以刚连上的
+        前一两秒画面会明显发虚（已被用户实测复现）。这里主动设初值。
+        轮询上限 20s，覆盖 SDP/ICE 协商与首帧渲染的等待时间。
+        """
+        bitrate = int(getattr(self.opt, 'video_bitrate', 0) or 0)
+        if bitrate <= 0:
+            return
+        deadline = time.time() + 20.0
+        while time.time() < deadline:
+            encoder = getattr(sender, '_RTCRtpSender__encoder', None)
+            if encoder is not None:
+                try:
+                    encoder.target_bitrate = bitrate
+                    webrtc_log.info(
+                        "initial video bitrate set: %d bps", bitrate,
+                        extra={"sessionid": sessionid},
+                    )
+                except Exception:
+                    webrtc_log.exception(
+                        "set initial video bitrate failed",
+                        extra={"sessionid": sessionid},
+                    )
+                return
+            await asyncio.sleep(0.05)
 
     async def _negotiate(self, pc, offer, sessionid):
         """SDP/ICE 协商阶段（setRemoteDescription → createAnswer → setLocalDescription）。

@@ -2,11 +2,12 @@
 # -*- coding: utf-8 -*-
 """
 PyTorch 模型转 ONNX 脚本
-支持 wav2lip、musetalk、ultralight 等模型的转换
+支持 wav2lip、musetalk、ultralight、gfpgan 等模型的转换
 
 用法:
     python convert_to_onnx.py --model wav2lip --input models/wav2lip.pth --output models/onnx/wav2lip.onnx
     python convert_to_onnx.py --model musetalk --input models/musetalk.pth --output models/onnx/musetalk.onnx
+    python convert_to_onnx.py --model gfpgan --input models/common/gfpgan/GFPGANv1.4.pth
 """
 
 import os
@@ -290,6 +291,58 @@ def convert_ultralight(input_path, output_path, opset_version=11):
     return output_path
 
 
+def convert_gfpgan(input_path, output_path, opset_version=13):
+    """
+    转换 GFPGANv1.4（人脸超分/复原）到 ONNX
+
+    输入:
+        - input: [1, 3, 512, 512] RGB，取值范围 [-1, 1]
+    输出:
+        - output: [1, 3, 512, 512] RGB，取值范围约 [-1, 1]（使用方需 clip）
+
+    说明:
+        - 只导出生成网络（GFPGANv1Clean），不含人脸检测/对齐，batch 固定为 1；
+        - StyleGAN 的噪声注入固定为 0，保证同一输入逐帧输出稳定（避免视频闪烁）。
+    """
+    from avatars.sr.gfpgan_arch import build_gfpgan_v14, GFPGANExportWrapper
+
+    print(f"[INFO] 加载 GFPGAN 模型: {input_path}")
+    model = build_gfpgan_v14(out_size=512)
+
+    checkpoint = torch.load(input_path, map_location='cpu')
+    state_dict = checkpoint.get('params_ema', checkpoint.get('params', checkpoint))
+    model.load_state_dict(state_dict, strict=True)
+    model.eval()
+
+    # 噪声注入置零：视频逐帧推理必须确定性，否则会出现闪烁
+    for buf in model.stylegan_decoder.noises.buffers():
+        buf.zero_()
+
+    wrapper = GFPGANExportWrapper(model).eval()
+
+    face_size = 512
+    dummy_input = torch.randn(1, 3, face_size, face_size)
+
+    ensure_dir(output_path)
+    print(f"[INFO] 导出 ONNX 到: {output_path}")
+    print(f"[INFO] 输入尺寸: input={tuple(dummy_input.shape)}")
+
+    with torch.no_grad():
+        torch.onnx.export(
+            wrapper,
+            dummy_input,
+            output_path,
+            export_params=True,
+            opset_version=opset_version,
+            do_constant_folding=True,
+            input_names=['input'],
+            output_names=['output'],
+        )
+
+    print(f"[SUCCESS] GFPGAN ONNX 模型已保存: {output_path}")
+    return output_path
+
+
 class VAEDecoderWrapper(torch.nn.Module):
     """
     VAE 解码器包装器，用于 ONNX 导出
@@ -468,8 +521,8 @@ def main():
         '--model', '-m',
         type=str,
         required=True,
-        choices=['wav2lip', 'musetalk', 'musetalk_vae', 'ultralight'],
-        help='模型类型: wav2lip, musetalk, musetalk_vae, ultralight'
+        choices=['wav2lip', 'musetalk', 'musetalk_vae', 'ultralight', 'gfpgan'],
+        help='模型类型: wav2lip, musetalk, musetalk_vae, ultralight, gfpgan'
     )
     
     parser.add_argument(
@@ -518,6 +571,8 @@ def main():
     if args.opset is None:
         if args.model in ['musetalk', 'musetalk_vae']:
             args.opset = 14  # musetalk 需要 opset 14+ 支持 scaled_dot_product_attention
+        elif args.model == 'gfpgan':
+            args.opset = 13
         else:
             args.opset = 11  # wav2lip 和 ultralight 使用 opset 11
     
@@ -536,6 +591,8 @@ def main():
             convert_musetalk_vae(args.input, args.output, args.opset)
         elif args.model == 'ultralight':
             convert_ultralight(args.input, args.output, args.opset)
+        elif args.model == 'gfpgan':
+            convert_gfpgan(args.input, args.output, args.opset)
         else:
             print(f"[ERROR] 不支持的模型类型: {args.model}")
             sys.exit(1)

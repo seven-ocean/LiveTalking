@@ -364,6 +364,8 @@ class MuseReal(BaseAvatar):
         x1, y1, x2, y2 = bbox
 
         res_frame = cv2.resize(pred_frame.astype(np.uint8),(x2-x1,y2-y1))
+        if self.sr is not None:
+            res_frame = self.sr.enhance(res_frame)
         mask = self.mask_list_cycle[idx]
         mask_crop_box = self.mask_coords_list_cycle[idx]
 

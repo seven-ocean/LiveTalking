@@ -95,7 +95,8 @@ gevent-websocket
 ffmpeg-python
 
 # ===== TTS 插件 =====
-edge_tts
+# MS 端点 403 修复（issue #490）需要 7.3.1+
+edge_tts>=7.3.1
 # 注意: 服务器预装 websockets 15.0.1，放宽版本约束以兼容
 websockets>=12.0,<16
 requests

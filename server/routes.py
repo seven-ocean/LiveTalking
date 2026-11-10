@@ -227,6 +227,36 @@ async def health(request):
     return json_ok(data={"sessions": len(session_manager.sessions)})
 
 
+def _sr_state():
+    """当前超分状态（未启用时 enabled=False）。"""
+    from avatars.sr.face_restorer import get_active_restorer
+    restorer = get_active_restorer()
+    if restorer is None:
+        return {"enabled": False, "strength": None, "backend": None, "device": None}
+    return {
+        "enabled": True,
+        "strength": restorer.strength,
+        "backend": restorer.backend,
+        "device": getattr(restorer, 'provider', ''),
+    }
+
+
+async def sr_config(request):
+    """超分配置：GET 查询状态，POST {"strength": 0~1} 运行时调整强度。"""
+    try:
+        if request.method == 'POST':
+            from avatars.sr.face_restorer import set_sr_strength
+            params = await request.json()
+            value = set_sr_strength(params.get('strength'))
+            if value is None:
+                return json_error("SR not enabled")
+            return json_ok(data=_sr_state())
+        return json_ok(data=_sr_state())
+    except Exception as e:
+        logger.exception('sr_config exception:')
+        return json_error(str(e))
+
+
 # ─── 路由注册 ──────────────────────────────────────────────────────────────
 
 def setup_routes(app):
@@ -240,6 +270,8 @@ def setup_routes(app):
     app.router.add_get("/config", client_config)
     app.router.add_get("/api/admin/config", admin_config)
     app.router.add_get("/api/admin/sessions", admin_sessions)
+    app.router.add_get("/api/sr/config", sr_config)
+    app.router.add_post("/api/sr/config", sr_config)
     app.router.add_post("/stop_session", stop_session)
     app.router.add_get("/health", health)
 

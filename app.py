@@ -84,6 +84,13 @@ _model_load_lock = Lock()  # 保证同一模型只加载一次（并发去重）
 _avatar_state: Dict[str, dict] = {}
 _avatar_state_lock = Lock()
 _avatar_load_lock = Lock()  # 保证同一时刻只有一个 avatar 冷加载（并发去重）
+
+# ─── 形象缓存策略 ───────────────────────────────────────────────
+# 模型权重按模型常驻（_model_runtimes），所有形象共享：A 切到 B 不会重新加载
+# 权重、也不会多占显存，只是换一份形象帧数据（存在内存里）。这里只对帧数据做
+# LRU 淘汰，默认保留最近用过的 2 个形象；0 表示不限制。
+_AVATAR_CACHE_MAX = int(os.getenv("ZL_AVATAR_CACHE_MAX", "2"))
+_avatar_last_used: Dict[str, float] = {}
         
 
 #####webrtc###############################
@@ -149,7 +156,7 @@ def _load_model_weights(model_name: str, avatar_mod, opt):
         return avatar_mod.load_model()
     if model_name == 'wav2lip':
         if getattr(opt, 'use_onnx', False):
-            return avatar_mod.load_onnx_model(onnx_path)
+            return avatar_mod.load_onnx_model(onnx_path, opt)
         return avatar_mod.load_model("./models/wav2lip/wav2lip.pth")
     # ultralight
     return avatar_mod.load_model(opt)
@@ -186,10 +193,12 @@ def get_or_load_avatar(avatar_id: str):
     """
     cached = global_avatars.get(avatar_id)
     if cached is not None:
+        _avatar_last_used[avatar_id] = time.time()
         return cached
     with _avatar_load_lock:
         cached = global_avatars.get(avatar_id)
         if cached is not None:
+            _avatar_last_used[avatar_id] = time.time()
             return cached
         started = time.time()
         model_name = resolve_avatar_model(avatar_id)
@@ -199,14 +208,52 @@ def get_or_load_avatar(avatar_id: str):
             rt = ensure_model_runtime(model_name)
             avatar = rt["load_avatar"](avatar_id)
             global_avatars[avatar_id] = avatar
+            _avatar_last_used[avatar_id] = time.time()
             _update_avatar_state(avatar_id, status="ready",
                                  elapsedMs=int((time.time() - started) * 1000))
+            _evict_avatars(keep=avatar_id)
             return avatar
         except BaseException as e:
             _update_avatar_state(avatar_id, status="error",
                                  elapsedMs=int((time.time() - started) * 1000),
                                  error=str(e))
             raise
+
+
+def _active_avatar_ids() -> set:
+    """当前会话正在使用的形象（建会话中的占位会话不计）。"""
+    ids = set()
+    for sess in list(session_manager.sessions.values()):
+        aid = getattr(getattr(sess, "opt", None), "avatar_id", None)
+        if aid:
+            ids.add(aid)
+    return ids
+
+
+def _evict_avatars(keep: str = "") -> None:
+    """形象帧数据按 LRU 淘汰，保留最近用过的若干个。
+
+    淘汰的是内存里的形象帧（1080p 一套可达数百 MB），不是模型权重：权重在
+    _model_runtimes 里按模型共享，切换形象不会重复加载，显存也不会随形象数增长。
+    正在会话里用着的形象不淘汰。
+    """
+    if _AVATAR_CACHE_MAX <= 0:
+        return
+    active = _active_avatar_ids()
+    dropped = []
+    while len(global_avatars) > _AVATAR_CACHE_MAX:
+        candidates = [aid for aid in global_avatars if aid not in active and aid != keep]
+        if not candidates:
+            break
+        victim = min(candidates, key=lambda aid: _avatar_last_used.get(aid) or 0.0)
+        global_avatars.pop(victim, None)
+        _avatar_last_used.pop(victim, None)
+        with _avatar_state_lock:
+            _avatar_state.pop(victim, None)
+        dropped.append(victim)
+    if dropped:
+        gc.collect()
+        logger.info("形象缓存超上限，已淘汰: %s", ", ".join(dropped))
 
 def _safe_load_avatar(avatar_id: str):
     """后台线程入口：吞掉异常，仅记录日志（状态已写入注册表）。"""
@@ -342,6 +389,14 @@ def main():
 
     logger.info(opt)
 
+    if getattr(opt, 'use_trt', False):
+        from utils.device import tensorrt_available
+        if not tensorrt_available():
+            logger.warning("--use_trt 已开启，但 TensorRT 运行时不可用（需 pip install tensorrt-cu12），"
+                           "将回退 CUDAExecutionProvider")
+        elif not getattr(opt, 'use_onnx', False):
+            logger.warning("--use_trt 只对 ONNX 推理生效；当前未开 --use_onnx，主模型与超分仍走 PyTorch")
+
     # ─── 启动授权校验（license_check，默认关闭）────────────────────
     # 开启后向 zl-ai 主包 /aihuman/license/status 校验授权，失败则拒绝启动
     from license_check import run_license_check
@@ -356,6 +411,14 @@ def main():
 
     # 预加载默认形象（缓存优先，内部按形象解析模型）
     get_or_load_avatar(opt.avatar_id)
+
+    # 超分模型预加载（--use_sr）：启动即加载并打印实际设备，避免首次会话才加载；
+    # 拿不到 GPU 时按配置降级（默认直接关闭超分，不会静默跑 CPU）
+    if getattr(opt, 'use_sr', False):
+        from avatars.sr.face_restorer import get_face_restorer
+        _sr = get_face_restorer(opt)
+        if _sr is not None:
+            logger.info("[SR] 超分已启用: backend=%s, device=%s", _sr.backend, _sr.provider)
 
     # ultralight 的 warm_up 依赖形象数据，载入默认形象后预热（保持原行为）
     if opt.model == 'ultralight':
@@ -407,6 +470,7 @@ def main():
                                     sid, session_manager.idle_seconds(sid))
                         session_manager.stop_session(sid)
                         session_manager.remove_session(sid)
+                _evict_avatars()
             except Exception:
                 logger.exception("session reaper error")
 

@@ -530,38 +530,343 @@
             .form-group textarea { min-width: 140px; }
             .msg { max-width: 95%; }
         }
+
+        /* ===== 全屏双栏布局：左侧画面 / 右侧参数与对话 ===== */
+        html, body { height: 100%; }
+        body {
+            height: 100vh;
+            min-height: 0;
+            padding: 0;
+            overflow: hidden;
+            display: block;
+            background: radial-gradient(1200px 600px at 20% 0%, #1e1b4b 0%, #0f0c29 45%, #080812 100%);
+        }
+        .container {
+            width: 100vw;
+            height: 100vh;
+            max-width: none;
+            padding: 0;
+            border: none;
+            border-radius: 0;
+            box-shadow: none;
+            background: transparent;
+            backdrop-filter: none;
+            -webkit-backdrop-filter: none;
+            display: flex;
+            align-items: stretch;
+        }
+
+        /* 左侧画面 */
+        .stage {
+            flex: 1 1 auto;
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            padding: 14px 14px 14px 18px;
+            gap: 10px;
+        }
+        .stage-top {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+        .stage-top .brand { display: flex; align-items: center; gap: 10px; }
+        .stage-top h1 {
+            font-size: 20px;
+            font-weight: 700;
+            letter-spacing: 1px;
+            background: linear-gradient(90deg, #a78bfa, #60a5fa, #34d399);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .stage-top .tag {
+            font-size: 11px;
+            background: rgba(167,139,250,0.15);
+            border: 1px solid rgba(167,139,250,0.25);
+            color: #a78bfa;
+            padding: 3px 10px;
+            border-radius: 20px;
+        }
+        .stage-controls { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .stage-controls button { padding: 7px 16px; font-size: 13px; border-radius: 9px; }
+        .stage-controls #connStatus { margin-right: 2px; }
+
+        .video-wrap {
+            position: relative;
+            flex: 1 1 auto;
+            min-height: 0;
+            background: #000;
+            border-radius: 16px;
+            overflow: hidden;
+            border: 1px solid rgba(255,255,255,0.08);
+            box-shadow: 0 18px 45px rgba(0,0,0,0.5);
+        }
+        .video-wrap video {
+            width: 100%;
+            height: 100%;
+            max-width: none;
+            object-fit: contain;
+            border-radius: 0;
+            box-shadow: none;
+            display: block;
+        }
+        .video-overlay {
+            position: absolute;
+            left: 12px;
+            right: 12px;
+            bottom: 12px;
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            pointer-events: none;
+        }
+        .video-chip {
+            font-size: 11px;
+            line-height: 1;
+            color: rgba(255,255,255,0.8);
+            background: rgba(0,0,0,0.55);
+            border: 1px solid rgba(255,255,255,0.12);
+            padding: 6px 10px;
+            border-radius: 12px;
+            white-space: nowrap;
+        }
+        .video-chip.error {
+            color: #fca5a5;
+            border-color: rgba(239,68,68,0.4);
+        }
+
+        /* 右侧参数 / 对话栏 */
+        .sidebar {
+            flex: 0 0 400px;
+            width: 400px;
+            height: 100vh;
+            overflow-y: auto;
+            overflow-x: hidden;
+            padding: 14px 16px;
+            background: rgba(8,8,20,0.6);
+            border-left: 1px solid rgba(255,255,255,0.08);
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .sidebar::-webkit-scrollbar { width: 6px; }
+        .sidebar::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 10px; }
+
+        .panel {
+            background: rgba(255,255,255,0.045);
+            border: 1px solid rgba(255,255,255,0.07);
+            border-radius: 12px;
+            padding: 10px 12px;
+        }
+        .panel-title {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            font-size: 11px;
+            font-weight: 600;
+            letter-spacing: 1.2px;
+            text-transform: uppercase;
+            color: rgba(255,255,255,0.45);
+            margin-bottom: 8px;
+        }
+        .panel-title .panel-sub {
+            font-size: 10px;
+            font-weight: 400;
+            letter-spacing: 0;
+            text-transform: none;
+            color: rgba(255,255,255,0.3);
+        }
+        .panel-title .model-toggle { margin-left: auto; text-transform: none; letter-spacing: 0; }
+        .panel .option { margin-bottom: 6px; }
+        .panel .option:last-child { margin-bottom: 0; }
+
+        .row { display: flex; align-items: center; gap: 8px; }
+        .row input[type="text"] {
+            flex: 1 1 auto;
+            min-width: 0;
+            height: 34px;
+            padding: 0 12px;
+            border-radius: 9px;
+            border: 1px solid rgba(255,255,255,0.1);
+            background: rgba(0,0,0,0.3);
+            color: #e0e0e0;
+            font-size: 13px;
+            font-family: inherit;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        .row input[type="text"]:focus { border-color: rgba(124,58,237,0.5); }
+        .row input[type="text"]::placeholder { color: rgba(255,255,255,0.3); }
+
+        /* 直接朗读输入区 */
+        #ttsText {
+            width: 100%;
+            height: 104px;
+            padding: 10px 12px;
+            border-radius: 10px;
+            border: 1px solid rgba(255,255,255,0.1);
+            background: rgba(0,0,0,0.3);
+            color: #e0e0e0;
+            font-size: 13px;
+            line-height: 1.6;
+            font-family: inherit;
+            resize: none;
+            outline: none;
+            transition: border-color 0.2s;
+        }
+        #ttsText:focus { border-color: rgba(124,58,237,0.5); }
+        #ttsText::placeholder { color: rgba(255,255,255,0.3); }
+        .tts-actions {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-top: 8px;
+        }
+        .tts-actions .asr-status {
+            flex: 1 1 auto;
+            align-self: center;
+            white-space: normal;
+        }
+        .tts-actions #btnTts { margin-left: auto; }
+
+        .btn-accent {
+            background: linear-gradient(135deg, #7c3aed, #6366f1);
+            box-shadow: 0 4px 12px rgba(124,58,237,0.3);
+            padding: 8px 16px;
+            font-size: 13px;
+            white-space: nowrap;
+        }
+        .btn-accent:hover:not(:disabled) {
+            box-shadow: 0 6px 18px rgba(124,58,237,0.45);
+            transform: translateY(-1px);
+        }
+
+        .sidebar .form-inline { margin-top: 0; }
+        .sidebar .form-group { display: block; }
+        .sidebar .form-group p { width: auto; }
+        .sidebar .form-group textarea {
+            width: 100%;
+            height: 60px;
+            min-width: 0;
+            resize: none;
+            padding: 9px 12px;
+            font-size: 13px;
+        }
+        .echo-actions {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-top: 8px;
+            flex-wrap: wrap;
+        }
+        .echo-actions .asr-buttons { align-self: center; }
+        .echo-actions #sendBtn { margin-left: auto; }
+        .thinking-indicator { margin-top: 6px; }
+
+        .sidebar .chat-area {
+            flex: 1 1 auto;
+            min-height: 160px;
+            margin-top: 0;
+            display: flex;
+            flex-direction: column;
+        }
+        .sidebar .chat-messages {
+            flex: 1 1 auto;
+            max-height: none;
+            min-height: 120px;
+            margin-bottom: 0;
+        }
+
+        .config-details { margin-top: 8px; }
+        .config-details > summary {
+            cursor: pointer;
+            font-size: 12px;
+            color: rgba(255,255,255,0.45);
+            padding: 4px 0;
+            list-style: none;
+            user-select: none;
+        }
+        .config-details > summary::-webkit-details-marker { display: none; }
+        .config-details > summary::before { content: "▸ "; color: rgba(255,255,255,0.3); }
+        .config-details[open] > summary::before { content: "▾ "; }
+        .config-details .config-info { margin-top: 8px; }
+        .config-details .ci-section { padding: 9px 12px; }
+        .config-details .ci-status { padding: 0 0 2px; }
+
+        @media (max-width: 900px) {
+            body { overflow: auto; height: auto; }
+            .container { flex-direction: column; height: auto; min-height: 100vh; }
+            .stage { min-height: 60vh; }
+            .sidebar {
+                flex: none;
+                width: 100%;
+                height: auto;
+                border-left: none;
+                border-top: 1px solid rgba(255,255,255,0.08);
+            }
+        }
     </style>
 </head>
 <body>
 
 <div class="container">
 
-    <!-- 顶部标题 -->
-    <div class="header">
-        <div style="display:flex;align-items:center;gap:12px;">
-            <img src="logo.png" alt="logo" style="height:32px;width:auto;border-radius:8px;">
-            <h1>臻灵数字人 demo</h1>
+    <!-- 左侧：全屏画面 -->
+    <div class="stage">
+        <div class="stage-top">
+            <div class="brand">
+                <img src="logo.png" alt="logo" style="height:30px;width:auto;border-radius:8px;">
+                <h1>臻灵数字人</h1>
+                <span class="tag">WebRTC</span>
+            </div>
+            <div class="stage-controls">
+                <span class="asr-status" id="connStatus">未连接</span>
+                <button id="start" onclick="start()">Start</button>
+                <button id="stop" style="display: none" onclick="stop()">Stop</button>
+                <button id="btn_start_record">Start Recording</button>
+                <button id="btn_stop_record" disabled>Stop Recording</button>
+            </div>
         </div>
-        <span class="tag">Maca · WebRTC</span>
+        <div class="video-wrap">
+            <video id="video" autoplay="true" playsinline="true"></video>
+            <div class="video-overlay">
+                <span class="video-chip" id="videoStats">-- Mbps · -- · -- fps</span>
+                <span class="video-chip" id="srStatus">超分：读取中…</span>
+            </div>
+        </div>
+        <audio id="audio" autoplay="true"></audio>
+        <input type="hidden" id="sessionid" value="0">
     </div>
 
-    <!-- STUN 选项 -->
-    <div class="option">
-        <label>
-            <input id="use-stun" type="checkbox"/>
-            Use STUN server
-        </label>
-    </div>
+    <!-- 右侧：参数 + 对话 -->
+    <aside class="sidebar">
 
-    <!-- 控制按钮 -->
-    <button id="start" onclick="start()">Start</button>
-    <button id="stop" style="display: none" onclick="stop()">Stop</button>
-    <button class="btn btn-primary" id="btn_start_record">Start Recording</button>
-    <button class="btn btn-primary" id="btn_stop_record" disabled>Stop Recording</button>
-    <input type="hidden" id="sessionid" value="0">
+        <!-- 连接参数 -->
+        <div class="panel">
+            <div class="panel-title">连接参数</div>
+            <div class="option">
+                <label>
+                    <input id="use-stun" type="checkbox"/>
+                    Use STUN server
+                </label>
+            </div>
+            <div class="option" style="gap:8px;">
+                <span style="font-size:12px;color:rgba(255,255,255,0.55);white-space:nowrap;">超分强度</span>
+                <input id="srStrength" type="range" min="0" max="100" step="5" value="60" style="flex:1;min-width:80px;">
+                <span id="srStrengthVal" style="font-size:12px;color:#a78bfa;width:34px;text-align:right;">0.60</span>
+            </div>
+        </div>
 
-    <!-- 大模型配置信息（可编辑） -->
-    <div class="config-info" id="configInfo">
+
+    <!-- 大模型配置信息（可编辑，默认折叠） -->
+    <div class="panel">
+        <details class="config-details">
+            <summary>大模型配置（地址 / Key / 模型）</summary>
+            <div class="config-info" id="configInfo">
         <!-- 千问配置 -->
         <div class="ci-section" id="ciQianwen">
             <div class="ci-header">
@@ -628,51 +933,64 @@
                 <button class="btn-ci btn-ci-save" onclick="saveOnlineConfig()">保存</button>
             </div>
         </div>
-    </div>
-    <div class="ci-status" id="ciStatus">当前模式：千问 · 可编辑上方配置后点击保存</div>
-
-    <!-- 媒体区 -->
-    <div id="media">
-        <h2>Media</h2>
-        <audio id="audio" autoplay="true"></audio>
-        <video id="video" style="width:100%; max-width:100%; height:auto;" autoplay="true" playsinline="true"></video>
+            </div>
+            <div class="ci-status" id="ciStatus">当前模式：千问 · 可编辑上方配置后点击保存</div>
+        </details>
     </div>
 
-    <!-- 发送表单（原样保留，连接大模型） -->
-    <form class="form-inline" id="echo-form">
-        <div class="form-group">
-            <p>
-                输入文字 · 大模型
-                <span class="model-toggle">
-                    <button type="button" class="btn-mode active" id="btnModeQianwen">千问</button>
-                    <button type="button" class="btn-mode" id="btnModeLocal">本地</button>
-                    <button type="button" class="btn-mode" id="btnModeOnline">线上</button>
-                </span>
-            </p>
-            <textarea cols="2" rows="3" style="width:600px;height:50px;" class="form-control" id="message" placeholder="输入您的问题，按 Enter 发送…">test</textarea>
-            <div class="asr-buttons">
-                <button type="button" class="btn-asr" id="btnMic" title="麦克风录音识别">
-                    <svg viewBox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Z"/><path d="M17 11a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.93V21h2v-3.07A7 7 0 0 0 19 11h-2Z"/></svg>
-                </button>
-                <button type="button" class="btn-asr" id="btnUpload" title="上传音频文件识别">
-                    <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z"/><path d="M14 2v6h6"/><path d="M12 18v-6"/><path d="m9 15 3-3 3 3"/></svg>
-                </button>
-                <input type="file" id="audioFileInput" accept="audio/*" style="display:none">
+    <!-- 直接朗读（不经过大模型） -->
+    <div class="panel">
+        <div class="panel-title">直接朗读 <span class="panel-sub">不经过大模型</span></div>
+        <form id="tts-form">
+            <textarea id="ttsText" placeholder="输入要朗读的文本，Enter 播报，Shift+Enter 换行…">大家好，欢迎来到这里。我是由昱扬科技开发的臻灵数字人，您的数字讲解员。接下来由我为您简单介绍。您可以随时向我提问，我会尽力为您解答，祝您参观愉快。</textarea>
+            <div class="tts-actions">
+                <span class="asr-status" id="ttsStatus"></span>
+                <button type="submit" class="btn-accent" id="btnTts">朗读</button>
             </div>
-            <span class="asr-status" id="asrStatus"></span>
-            <button type="submit" class="btn btn-default" id="sendBtn">Send</button>
-            <div class="thinking-indicator" id="thinkingIndicator">
-                <div class="spinner"></div>
-                <span>大模型思考中…</span>
-            </div>
+        </form>
+    </div>
+
+    <!-- 大模型对话 -->
+    <div class="panel">
+        <div class="panel-title">
+            <span>大模型对话</span>
+            <span class="model-toggle">
+                <button type="button" class="btn-mode active" id="btnModeQianwen">千问</button>
+                <button type="button" class="btn-mode" id="btnModeLocal">本地</button>
+                <button type="button" class="btn-mode" id="btnModeOnline">线上</button>
+            </span>
         </div>
-    </form>
+        <form id="echo-form">
+            <div class="form-group">
+                <textarea id="message" placeholder="输入您的问题，按 Enter 发送…">test</textarea>
+                <div class="echo-actions">
+                    <div class="asr-buttons">
+                        <button type="button" class="btn-asr" id="btnMic" title="麦克风录音识别">
+                            <svg viewBox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Z"/><path d="M17 11a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.93V21h2v-3.07A7 7 0 0 0 19 11h-2Z"/></svg>
+                        </button>
+                        <button type="button" class="btn-asr" id="btnUpload" title="上传音频文件识别">
+                            <svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6z"/><path d="M14 2v6h6"/><path d="M12 18v-6"/><path d="m9 15 3-3 3 3"/></svg>
+                        </button>
+                        <input type="file" id="audioFileInput" accept="audio/*" style="display:none">
+                    </div>
+                    <span class="asr-status" id="asrStatus"></span>
+                    <button type="submit" class="btn-accent" id="sendBtn">Send</button>
+                </div>
+                <div class="thinking-indicator" id="thinkingIndicator">
+                    <div class="spinner"></div>
+                    <span>大模型思考中…</span>
+                </div>
+            </div>
+        </form>
+    </div>
 
     <!-- 对话消息区 -->
     <div class="chat-area" id="chatArea">
-        <div class="chat-messages" id="chatMessages">
-        </div>
+        <div class="panel-title" style="margin-bottom:6px;">对话记录</div>
+        <div class="chat-messages" id="chatMessages"></div>
     </div>
+
+    </aside>
 
 </div>
 
@@ -745,6 +1063,12 @@ function start() {
         }
     });
 
+    pc.addEventListener('connectionstatechange', () => {
+        var el = document.getElementById('connStatus');
+        if (el) el.textContent = pc.connectionState;
+    });
+
+    document.getElementById('connStatus').textContent = '连接中…';
     document.getElementById('start').style.display = 'none';
     negotiate();
     document.getElementById('stop').style.display = 'inline-block';
@@ -752,6 +1076,7 @@ function start() {
 
 function stop() {
     document.getElementById('stop').style.display = 'none';
+    document.getElementById('connStatus').textContent = '未连接';
     setTimeout(() => {
         pc.close();
     }, 500);
@@ -1123,6 +1448,77 @@ function uploadAudioFile(file) {
     callASR(file, file.name).then(fillAndSubmit).catch(function() {});
 }
 
+// ===== 超分强度调试 =====
+var srStrengthTimer = null;
+
+function loadSrConfig() {
+    fetch('./api/sr/config').then(function(r) { return r.json(); }).then(function(res) {
+        var d = (res && res.data) || {};
+        var status = document.getElementById('srStatus');
+        if (!d.enabled) {
+            status.textContent = '超分：未启用（服务端未加 --use_sr）';
+            status.classList.add('error');
+            return;
+        }
+        status.classList.remove('error');
+        status.textContent = '超分：' + d.backend + ' · ' + d.device;
+        if (typeof d.strength === 'number') {
+            document.getElementById('srStrength').value = Math.round(d.strength * 100);
+            document.getElementById('srStrengthVal').textContent = d.strength.toFixed(2);
+        }
+    }).catch(function() {
+        document.getElementById('srStatus').textContent = '超分：读取失败';
+    });
+}
+
+function onSrStrengthInput() {
+    var value = parseInt(document.getElementById('srStrength').value, 10) / 100;
+    document.getElementById('srStrengthVal').textContent = value.toFixed(2);
+    // 拖动时防抖，300ms 内只发一次请求
+    if (srStrengthTimer) clearTimeout(srStrengthTimer);
+    srStrengthTimer = setTimeout(function() { saveSrStrength(value); }, 300);
+}
+
+function saveSrStrength(value) {
+    fetch('./api/sr/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ strength: value })
+    }).then(function(r) { return r.json(); }).then(function(res) {
+        if (res.code !== 0) {
+            document.getElementById('srStatus').textContent = '超分：' + (res.msg || '设置失败');
+        }
+    }).catch(function() {
+        document.getElementById('srStatus').textContent = '超分：设置失败（网络错误）';
+    });
+}
+
+// ===== 视频质量统计（码率 / 分辨率 / 帧率） =====
+var videoStatCache = {};
+
+function updateVideoStats() {
+    if (!pc || pc.connectionState !== 'connected') return;
+    pc.getStats().then(function(stats) {
+        stats.forEach(function(report) {
+            if (report.type !== 'inbound-rtp' || report.kind !== 'video') return;
+            var now = report.timestamp;
+            var bytes = report.bytesReceived;
+            var mbps = null;
+            if (videoStatCache.last && now > videoStatCache.last.timestamp) {
+                var deltaBits = (bytes - videoStatCache.last.bytes) * 8;
+                mbps = deltaBits / (now - videoStatCache.last.timestamp) / 1000;
+            }
+            videoStatCache.last = { timestamp: now, bytes: bytes };
+            var w = report.frameWidth, h = report.frameHeight;
+            var fps = report.framesPerSecond;
+            document.getElementById('videoStats').textContent =
+                (mbps === null ? '--' : mbps.toFixed(1)) + ' Mbps · ' +
+                (w && h ? w + 'x' + h : '--') + ' · ' +
+                (fps ? fps.toFixed(1) : '--') + ' fps';
+        });
+    }).catch(function() {});
+}
+
 // ===== jQuery 逻辑（原始 + 新增大模型） =====
 $(document).ready(function() {
     // 默认千问模式
@@ -1222,6 +1618,59 @@ $(document).ready(function() {
         }
     });
 
+    // 直接朗读：不调用大模型，直接把文本交给数字人 TTS 播报
+    // Enter 播报，Shift+Enter 换行
+    $('#ttsText').on('keydown', function(e) {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            $('#tts-form').trigger('submit');
+        }
+    });
+
+    $('#tts-form').on('submit', function(e) {
+        e.preventDefault();
+        var text = $('#ttsText').val().trim();
+        if (!text) return;
+        var sessionid = String(document.getElementById('sessionid').value);
+        var status = document.getElementById('ttsStatus');
+        if (!sessionid || sessionid === '0') {
+            status.textContent = '请先点击 Start 连接数字人';
+            status.classList.add('error');
+            return;
+        }
+        var spoken = sanitizeForTTS(text);
+        if (!spoken) {
+            status.textContent = '文本里没有可朗读的内容';
+            status.classList.add('error');
+            return;
+        }
+        status.classList.remove('error');
+        status.classList.add('processing');
+        status.textContent = '发送中…';
+        fetch('./human', {
+            body: JSON.stringify({
+                text: spoken,
+                type: 'echo',
+                interrupt: true,
+                sessionid: sessionid,
+            }),
+            headers: { 'Content-Type': 'application/json' },
+            method: 'POST'
+        }).then(function(r) { return r.json(); }).then(function(res) {
+            status.classList.remove('processing');
+            if (res.code === 0) {
+                status.textContent = '已发送朗读';
+            } else {
+                status.textContent = '失败：' + (res.msg || '未知错误');
+                status.classList.add('error');
+            }
+        }).catch(function() {
+            status.classList.remove('processing');
+            status.classList.add('error');
+            status.textContent = '发送失败（网络错误）';
+        });
+    });
+
     // 录制按钮（原始逻辑，未改动）
     $('#btn_start_record').click(function() {
         fetch('./record', {
@@ -1258,6 +1707,11 @@ $(document).ready(function() {
             }
         });
     });
+
+    // 超分强度滑杆（拖动即生效，服务端运行时调整）
+    $('#srStrength').on('input', onSrStrengthInput);
+    loadSrConfig();
+    setInterval(updateVideoStats, 1000);
 });
 </script>
 
