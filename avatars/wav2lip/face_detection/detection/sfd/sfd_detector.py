@@ -14,9 +14,15 @@ models_urls = {
     's3fd': 'https://www.adrianbulat.com/downloads/python-fan/s3fd-619a316812.pth',
 }
 
+# 权重统一放在仓库根目录 models/common/s3fd/（models/ 不入库，避免大文件进 Git）
+DEFAULT_DETECTOR_PATH = os.path.abspath(os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    '..', '..', '..', '..', '..',
+    'models', 'common', 's3fd', 's3fd.pth'))
+
 
 class SFDDetector(FaceDetector):
-    def __init__(self, device, path_to_detector=os.path.join(os.path.dirname(os.path.abspath(__file__)), 's3fd.pth'), verbose=False):
+    def __init__(self, device, path_to_detector=DEFAULT_DETECTOR_PATH, verbose=False):
         super(SFDDetector, self).__init__(device, verbose)
 
         # Initialise the face detector
