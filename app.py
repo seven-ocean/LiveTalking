@@ -84,6 +84,20 @@ _model_load_lock = Lock()  # 保证同一模型只加载一次（并发去重）
 _avatar_state: Dict[str, dict] = {}
 _avatar_state_lock = Lock()
 _avatar_load_lock = Lock()  # 保证同一时刻只有一个 avatar 冷加载（并发去重）
+
+# ─── 形象缓存策略 ───────────────────────────────────────────────
+# 模型权重按模型常驻（_model_runtimes），所有形象共享：A 切到 B 不会重新加载
+# 权重、也不会多占显存，只是换一份形象帧数据（存在内存里）。这里只对帧数据做
+# LRU 淘汰，默认保留最近用过的 2 个形象；0 表示不限制。
+_AVATAR_CACHE_MAX = int(os.getenv("ZL_AVATAR_CACHE_MAX", "2"))
+_avatar_last_used: Dict[str, float] = {}
+
+# ─── 进程级模型切换 ─────────────────────────────────────────────
+# app.py 只加载一个模型；切换到另一个模型时写目标 avatar 后以 42 退出，
+# 由 run_talking.sh 重启新进程。这样 GPU/CUDA 上下文由 OS 彻底回收。
+_PROCESS_SWITCH = os.getenv("ZL_PROCESS_SWITCH", "0") == "1"
+_DEFER_MODEL_LOAD = os.getenv("ZL_DEFER_MODEL_LOAD", "0") == "1"
+_SWITCH_TARGET_FILE = os.getenv("ZL_SWITCH_TARGET_FILE", "")
         
 
 #####webrtc###############################
@@ -154,6 +168,66 @@ def _load_model_weights(model_name: str, avatar_mod, opt):
     # ultralight
     return avatar_mod.load_model(opt)
 
+def _needs_model_switch(avatar_id: str) -> bool:
+    if not _PROCESS_SWITCH:
+        return False
+    model_name = resolve_avatar_model(avatar_id)
+    return bool(_model_runtimes) and model_name not in _model_runtimes
+
+
+def _write_switch_target(avatar_id: str) -> None:
+    if _SWITCH_TARGET_FILE:
+        try:
+            with open(_SWITCH_TARGET_FILE, "w", encoding="utf-8") as f:
+                f.write(avatar_id)
+        except Exception:
+            logger.exception("写入进程级切换目标失败")
+    logger.info("请求进程级切换模型: avatar=%s", avatar_id)
+
+
+def _release_other_models(keep_model: str) -> None:
+    """切换模型前释放旧模型资源：停旧会话、清形象缓存、删旧模型 runtime。
+
+    Wav2Lip 和 MuseTalk 的权重/推理上下文不能在同一进程里长期共存；
+    切换过去时先把旧模型相关的会话、形象帧和权重引用全部释放，再加载新模型。
+    """
+    if not _PROCESS_SWITCH:
+        # keep 模式：客户高配机，两个模型保留并发，不做释放/重启
+        return
+    released = []
+    for sid, sess in list(session_manager.sessions.items()):
+        model = getattr(getattr(sess, "opt", None), "model", None)
+        if model and model != keep_model:
+            try:
+                session_manager.stop_session(sid)
+                session_manager.remove_session(sid)
+                released.append(f"session:{sid}")
+            except Exception:
+                logger.exception("释放旧会话失败: %s", sid)
+    for aid in list(global_avatars):
+        try:
+            if resolve_avatar_model(aid) != keep_model:
+                global_avatars.pop(aid, None)
+                _avatar_last_used.pop(aid, None)
+                with _avatar_state_lock:
+                    _avatar_state.pop(aid, None)
+                released.append(f"avatar:{aid}")
+        except Exception:
+            pass
+    for model in list(_model_runtimes):
+        if model != keep_model:
+            _model_runtimes.pop(model, None)
+            released.append(f"model:{model}")
+    if released:
+        gc.collect()
+        try:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            logger.exception("empty_cache 失败")
+        logger.info("切换模型释放旧资源: %s", ", ".join(released))
+
+
 def ensure_model_runtime(model_name: str) -> dict:
     """确保某模型的权重与 load_avatar 就绪（懒加载 + 常驻缓存，并发去重）。"""
     rt = _model_runtimes.get(model_name)
@@ -165,14 +239,18 @@ def ensure_model_runtime(model_name: str) -> dict:
             return rt
         if model_name not in _AVATAR_MODULES:
             raise ValueError(f"未知模型: {model_name}")
+        _release_other_models(model_name)
         avatar_mod = importlib.import_module(_AVATAR_MODULES[model_name])
         logger.info("懒加载模型运行时: %s", model_name)
         weights = _load_model_weights(model_name, avatar_mod, opt)
         # warm_up 签名各模型不同；ultralight 的 warm_up 依赖形象数据，延后到 main() 处理（保持原行为）
         if model_name == 'wav2lip':
+            # Wav2Lip 的 warmup 必须保留，不能跳过；只对 MuseTalk 做延迟 warmup
             avatar_mod.warm_up(opt.batch_size, weights, 256)
         elif model_name == 'musetalk':
-            avatar_mod.warm_up(opt.batch_size, weights)
+            # 跳过 warmup：MuseTalk 的 warmup 会一次性分配大块内存/显存，
+            # 在 16GB sGPU 配额下会直接把进程打掉；首次真实请求再按需分配。
+            logger.info("MuseTalk warmup skipped (deferred to first inference)")
         rt = {"model": weights, "load_avatar": avatar_mod.load_avatar}
         _model_runtimes[model_name] = rt
         logger.info("模型运行时就绪: %s", model_name)
@@ -184,12 +262,17 @@ def get_or_load_avatar(avatar_id: str):
     并发调用同一 avatar 时由 _avatar_load_lock 串行去重，只有一个真正执行
     load_avatar，其余在拿到锁后发现缓存已就绪直接复用。
     """
+    if _needs_model_switch(avatar_id):
+        _write_switch_target(avatar_id)
+        os._exit(42)
     cached = global_avatars.get(avatar_id)
     if cached is not None:
+        _avatar_last_used[avatar_id] = time.time()
         return cached
     with _avatar_load_lock:
         cached = global_avatars.get(avatar_id)
         if cached is not None:
+            _avatar_last_used[avatar_id] = time.time()
             return cached
         started = time.time()
         model_name = resolve_avatar_model(avatar_id)
@@ -199,14 +282,53 @@ def get_or_load_avatar(avatar_id: str):
             rt = ensure_model_runtime(model_name)
             avatar = rt["load_avatar"](avatar_id)
             global_avatars[avatar_id] = avatar
+            _avatar_last_used[avatar_id] = time.time()
             _update_avatar_state(avatar_id, status="ready",
                                  elapsedMs=int((time.time() - started) * 1000))
+            _evict_avatars(keep=avatar_id)
             return avatar
         except BaseException as e:
             _update_avatar_state(avatar_id, status="error",
                                  elapsedMs=int((time.time() - started) * 1000),
                                  error=str(e))
             raise
+
+
+def _active_avatar_ids() -> set:
+    """当前会话正在使用的形象（建会话中的占位会话不计）。"""
+    ids = set()
+    for sess in list(session_manager.sessions.values()):
+        aid = getattr(getattr(sess, "opt", None), "avatar_id", None)
+        if aid:
+            ids.add(aid)
+    return ids
+
+
+def _evict_avatars(keep: str = "") -> None:
+    """形象帧数据按 LRU 淘汰，保留最近用过的若干个。
+
+    淘汰的是内存里的形象帧（1080p 一套可达数百 MB），不是模型权重：权重在
+    _model_runtimes 里按模型共享，切换形象不会重复加载，显存也不会随形象数增长。
+    正在会话里用着的形象不淘汰。
+    """
+    if _AVATAR_CACHE_MAX <= 0:
+        return
+    active = _active_avatar_ids()
+    dropped = []
+    while len(global_avatars) > _AVATAR_CACHE_MAX:
+        candidates = [aid for aid in global_avatars if aid not in active and aid != keep]
+        if not candidates:
+            break
+        victim = min(candidates, key=lambda aid: _avatar_last_used.get(aid) or 0.0)
+        global_avatars.pop(victim, None)
+        _avatar_last_used.pop(victim, None)
+        with _avatar_state_lock:
+            _avatar_state.pop(victim, None)
+        dropped.append(victim)
+    if dropped:
+        gc.collect()
+        logger.info("形象缓存超上限，已淘汰: %s", ", ".join(dropped))
+
 
 def _safe_load_avatar(avatar_id: str):
     """后台线程入口：吞掉异常，仅记录日志（状态已写入注册表）。"""
@@ -272,6 +394,11 @@ async def warmup_avatar(request):
     """
     params = await request.json()
     avatar_id = params.get('avatar') or opt.avatar_id
+    if _needs_model_switch(avatar_id):
+        _write_switch_target(avatar_id)
+        asyncio.get_event_loop().call_later(0.3, os._exit, 42)
+        return web.Response(content_type="application/json",
+                            text=json.dumps({"code": 0, "status": "loading", "switch": True}))
     status = ensure_avatar_async(avatar_id)
     return web.Response(content_type="application/json",
                         text=json.dumps({"code": 0, "status": status}))
@@ -348,19 +475,24 @@ def main():
     run_license_check(opt)
 
     # ─── 加载主模型运行时（触发 @register 注册 + 权重加载）──────────
-    # 启动只加载 opt.model 一套权重（与现状启动开销一致）；其它模型在
-    # /offer 或 /warmup 首次用到时按形象懒加载并常驻（见 ensure_model_runtime）。
-    rt = ensure_model_runtime(opt.model)
-    model = rt["model"]                 # 兼容旧全局引用
-    load_avatar = rt["load_avatar"]     # 兼容旧全局引用
+    # 进程级切换时设置 ZL_DEFER_MODEL_LOAD=1：先启动 HTTP 服务，
+    # 由首个 /offer 或 /warmup 再加载目标模型，端口能尽快恢复。
+    if _DEFER_MODEL_LOAD:
+        model = None
+        load_avatar = None
+        logger.info("延迟模型加载（进程级切换模式），等待首个请求")
+    else:
+        rt = ensure_model_runtime(opt.model)
+        model = rt["model"]                 # 兼容旧全局引用
+        load_avatar = rt["load_avatar"]     # 兼容旧全局引用
 
-    # 预加载默认形象（缓存优先，内部按形象解析模型）
-    get_or_load_avatar(opt.avatar_id)
+        # 预加载默认形象（缓存优先，内部按形象解析模型）
+        get_or_load_avatar(opt.avatar_id)
 
-    # ultralight 的 warm_up 依赖形象数据，载入默认形象后预热（保持原行为）
-    if opt.model == 'ultralight':
-        _ul = importlib.import_module(_AVATAR_MODULES['ultralight'])
-        _ul.warm_up(opt.batch_size, global_avatars[opt.avatar_id], 160)
+        # ultralight 的 warm_up 依赖形象数据，载入默认形象后预热（保持原行为）
+        if opt.model == 'ultralight':
+            _ul = importlib.import_module(_AVATAR_MODULES['ultralight'])
+            _ul.warm_up(opt.batch_size, global_avatars[opt.avatar_id], 160)
 
     # init rtc manager
     session_manager.init_builder(build_avatar_session)
@@ -407,6 +539,7 @@ def main():
                                     sid, session_manager.idle_seconds(sid))
                         session_manager.stop_session(sid)
                         session_manager.remove_session(sid)
+                _evict_avatars()
             except Exception:
                 logger.exception("session reaper error")
 
