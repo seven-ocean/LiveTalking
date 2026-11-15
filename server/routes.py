@@ -3,6 +3,7 @@
 ###############################################################################
 
 import json
+import os
 import asyncio
 from aiohttp import web
 
@@ -174,7 +175,12 @@ async def admin_config(request):
     try:
         opt = request.app.get("opt")
         if opt:
-            return json_ok(data={"config": vars(opt)})
+            launch_keys = [k for k in os.environ.get("ZL_TALKING_LAUNCH_KEYS", "").split(",") if k]
+            return json_ok(data={
+                "config": vars(opt),
+                "launchFile": os.environ.get("ZL_TALKING_LAUNCH_FILE", ""),
+                "launchKeys": launch_keys,
+            })
         return json_error("Config not found")
     except Exception as e:
         logger.exception('admin_config exception:')

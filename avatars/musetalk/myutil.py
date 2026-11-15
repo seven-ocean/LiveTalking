@@ -1,6 +1,11 @@
 import numpy as np
 import cv2
 import copy
+import os
+
+# mask 羽化核大小（奇数，0/1=关闭）：边界硬切会把细微差异放大成边缘闪烁
+_MASK_BLUR = int(os.getenv('MUSETALK_MASK_BLUR', '0') or 0)
+
 
 def get_image_blending(image,face,face_box,mask_array,crop_box):
     body = image
@@ -11,6 +16,9 @@ def get_image_blending(image,face,face_box,mask_array,crop_box):
 
     mask_image = cv2.cvtColor(mask_array,cv2.COLOR_BGR2GRAY)
     mask_image = (mask_image/255).astype(np.float32)
+    if _MASK_BLUR > 1:
+        k = _MASK_BLUR if _MASK_BLUR % 2 == 1 else _MASK_BLUR + 1
+        mask_image = cv2.GaussianBlur(mask_image, (k, k), 0)
 
     # mask_not = cv2.bitwise_not(mask_array)
     # prospect_tmp = cv2.bitwise_and(face_large, face_large, mask=mask_array)

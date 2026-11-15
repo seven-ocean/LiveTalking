@@ -25,7 +25,16 @@ import json
 #from geventwebsocket.handler import WebSocketHandler
 import re
 import os
+import signal
+import faulthandler
 import numpy as np
+
+# 诊断：kill -USR1 <pid> 时把所有线程的 Python 栈打到 stderr（日志）。
+# 事件循环被卡住时这是唯一能定位阻塞点的手段；无副作用。
+try:
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
+except Exception:
+    pass
 from threading import Thread,Event,Lock
 #import multiprocessing
 import torch.multiprocessing as mp
@@ -228,6 +237,18 @@ def _release_other_models(keep_model: str) -> None:
         logger.info("切换模型释放旧资源: %s", ", ".join(released))
 
 
+def _warmup_resolution(model_name: str) -> int:
+    """warmup 分辨率由模型结构决定；--modelres 只做兼容提示，避免误设导致 warmup 失败。"""
+    expected = 256 if model_name == 'wav2lip' else 160 if model_name == 'ultralight' else getattr(opt, 'modelres', 192)
+    configured = getattr(opt, 'modelres', None)
+    if configured and configured != expected:
+        logger.warning(
+            'modelres=%s is ignored for %s warmup; using %s (model input is fixed)',
+            configured, model_name, expected,
+        )
+    return expected
+
+
 def ensure_model_runtime(model_name: str) -> dict:
     """确保某模型的权重与 load_avatar 就绪（懒加载 + 常驻缓存，并发去重）。"""
     rt = _model_runtimes.get(model_name)
@@ -246,7 +267,7 @@ def ensure_model_runtime(model_name: str) -> dict:
         # warm_up 签名各模型不同；ultralight 的 warm_up 依赖形象数据，延后到 main() 处理（保持原行为）
         if model_name == 'wav2lip':
             # Wav2Lip 的 warmup 必须保留，不能跳过；只对 MuseTalk 做延迟 warmup
-            avatar_mod.warm_up(opt.batch_size, weights, 256)
+            avatar_mod.warm_up(opt.batch_size, weights, _warmup_resolution('wav2lip'))
         elif model_name == 'musetalk':
             # 跳过 warmup：MuseTalk 的 warmup 会一次性分配大块内存/显存，
             # 在 16GB sGPU 配额下会直接把进程打掉；首次真实请求再按需分配。
@@ -358,14 +379,50 @@ def ensure_avatar_async(avatar_id: str) -> str:
     asyncio.get_event_loop().run_in_executor(None, _safe_load_avatar, avatar_id)
     return "loading"
 
+def _session_int(params: dict, key: str, current: int, min_value: int, max_value: int) -> int:
+    """读取 /offer 会话参数中的整数；非法/越界时回退启动默认值。"""
+    raw = params.get(key)
+    if raw is None or raw == '':
+        return current
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning('invalid %s=%r, keep %s', key, raw, current)
+        return current
+    if value < min_value or value > max_value:
+        logger.warning('invalid %s=%r (range %s~%s), keep %s', key, raw, min_value, max_value, current)
+        return current
+    return value
+
+
+def _session_str(params: dict, *keys: str):
+    """读取 /offer 会话参数中的非空字符串，支持驼峰/下划线别名。"""
+    for key in keys:
+        raw = params.get(key)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    return None
+
+
 def build_avatar_session(sessionid:str, params:dict)->BaseAvatar:
     opt_this = copy.deepcopy(opt)
     opt_this.sessionid = sessionid
 
-    avatar_id = params.get('avatar',opt.avatar_id)
+    avatar_id = params.get('avatar') or opt.avatar_id
     opt_this.avatar_id = avatar_id
-    ref_audio = params.get('refaudio','') #音色
-    ref_text = params.get('reftext','')
+    ref_audio = _session_str(params, 'refaudio', 'refAudio', 'ref_audio') or ''
+    ref_text = _session_str(params, 'reftext', 'refText', 'ref_text') or ''
+
+    # 配置端 Human 能力 defaultParams / 真实人配置 modelsParams 透传到 /offer 的会话参数。
+    # 优先级：/offer 显式值 > 能力中心默认值（由 zl-ai 注入）> 启动参数。
+    opt_this.batch_size = _session_int(params, 'batch_size', opt_this.batch_size, 1, 64)
+    opt_this.l = _session_int(params, 'l', opt_this.l, 0, 30)
+    opt_this.m = _session_int(params, 'm', opt_this.m, 0, 30)
+    opt_this.r = _session_int(params, 'r', opt_this.r, 0, 30)
+    requested_fps = _session_int(params, 'fps', opt_this.fps, 1, 60)
+    if requested_fps != 25:
+        logger.warning('fps=%s is not supported, zl-talking requires 25; keep 25', requested_fps)
+    opt_this.fps = 25
 
     # 按形象解析其真实模型，并用该模型的权重/loader 构建会话（支持单进程跨模型）
     model_name = resolve_avatar_model(avatar_id)
@@ -376,9 +433,18 @@ def build_avatar_session(sessionid:str, params:dict)->BaseAvatar:
     if ref_audio: #请求参数配置了参考音频
         opt_this.REF_FILE = ref_audio
         opt_this.REF_TEXT = ref_text
-    custom_config=params.get('custom_config','') #动作编排配置
+    custom_config = params.get('custom_config') or params.get('customConfig') or ''
     if custom_config:
-        opt_this.customopt = json.loads(custom_config)
+        try:
+            opt_this.customopt = custom_config if isinstance(custom_config, (list, dict)) else json.loads(custom_config)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            logger.warning('invalid custom_config, ignored: %s', exc)
+
+    logger.info(
+        '[session] %s params: avatar=%s, batch_size=%s, fps=%s, l/m/r=%s/%s/%s, refaudio=%s',
+        sessionid, avatar_id, opt_this.batch_size, opt_this.fps,
+        opt_this.l, opt_this.m, opt_this.r, opt_this.REF_FILE,
+    )
 
     opt_this.model = model_name  # 会话记录真实模型（供 /admin 状态等使用）
     avatar_session = registry.create("avatar", model_name, opt=opt_this, model=rt["model"], avatar=avatar_this)
@@ -386,6 +452,99 @@ def build_avatar_session(sessionid:str, params:dict)->BaseAvatar:
 
 async def offer(request):
     return await rtc_manager.handle_offer(request)
+
+
+# ─── HTTP-FLV 降级通道（见 server/rtc_manager.handle_flv_publish）─────────
+def _flv_response(data=None, msg="ok", status=200):
+    body = {"code": 0 if status == 200 else -1, "msg": msg}
+    if data is not None:
+        body["data"] = data
+    return web.Response(status=status, content_type="application/json", text=json.dumps(body))
+
+
+async def flv_publish(request):
+    """浏览器打开降级页时调用：起一路会话并 WHIP 推到本机 SRS。"""
+    # 正式环境只走 WebRTC / WebSocket；FLV 仅用于测试，默认关闭，避免测试进程抢 CPU。
+    if os.environ.get("FLV_TEST_ENABLED", "0").strip().lower() not in ("1", "true", "yes", "on"):
+        return web.json_response(
+            {"code": -1, "msg": "FLV 测试链路未启用（FLV_TEST_ENABLED=0）"}, status=404
+        )
+    body = {}
+    if request.can_read_body:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+    body = body if isinstance(body, dict) else {}
+    sessionid = (body.get("sessionid") or "").strip() or None
+    try:
+        sid = await rtc_manager.handle_flv_publish(body.get("push_url") or "", sessionid)
+    except Exception as exc:
+        logger.exception("flv_publish failed")
+        return _flv_response(msg=str(exc), status=500)
+    return _flv_response({"sessionid": sid, "url": "/live/livestream.flv"})
+
+
+async def flv_ping(request):
+    body = await request.json() if request.can_read_body else {}
+    sessionid = (body or {}).get("sessionid", "")
+    if not rtc_manager.touch_flv_publish(sessionid):
+        return _flv_response(msg="publish not found", status=404)
+    return _flv_response(rtc_manager.flv_status(sessionid))
+
+
+async def flv_unpublish(request):
+    body = {}
+    if request.can_read_body:
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+    sessionid = (body or {}).get("sessionid", "")
+    await rtc_manager.stop_flv_publish(sessionid)
+    return _flv_response()
+
+
+# ─── 带宽测试（bw-test.html 使用；走同一个 nginx 端口，测真实链路）──────────────
+async def speedtest_ping(request):
+    return web.json_response({"ok": True, "ts": time.time()})
+
+
+async def speedtest_download(request):
+    try:
+        total = int(request.query.get("bytes", str(32 * 1024 * 1024)))
+    except (TypeError, ValueError):
+        total = 32 * 1024 * 1024
+    total = max(1024 * 1024, min(total, 1024 * 1024 * 1024))
+    resp = web.StreamResponse(
+        headers={
+            "Content-Type": "application/octet-stream",
+            "Cache-Control": "no-store",
+            "Content-Length": str(total),
+        }
+    )
+    await resp.prepare(request)
+    chunk = b"\x00" * 65536
+    sent = 0
+    try:
+        while sent < total:
+            n = min(len(chunk), total - sent)
+            await resp.write(chunk[:n])
+            sent += n
+        await resp.write_eof()
+    except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
+        pass
+    return resp
+
+
+async def speedtest_upload(request):
+    total = 0
+    try:
+        async for chunk in request.content.iter_chunked(256 * 1024):
+            total += len(chunk)
+    except (ConnectionResetError, BrokenPipeError, asyncio.CancelledError):
+        pass
+    return web.json_response({"ok": True, "bytes": total})
 
 async def warmup_avatar(request):
     """预热 avatar：前端切换形象前调用，后台异步加载，立即返回，避免阻塞事件循环。
@@ -492,7 +651,7 @@ def main():
         # ultralight 的 warm_up 依赖形象数据，载入默认形象后预热（保持原行为）
         if opt.model == 'ultralight':
             _ul = importlib.import_module(_AVATAR_MODULES['ultralight'])
-            _ul.warm_up(opt.batch_size, global_avatars[opt.avatar_id], 160)
+            _ul.warm_up(opt.batch_size, global_avatars[opt.avatar_id], _warmup_resolution('ultralight'))
 
     # init rtc manager
     session_manager.init_builder(build_avatar_session)
@@ -520,7 +679,9 @@ def main():
     # （标签页崩溃/断网/直接关掉）时 WS 断开路径也可能走不到，会话就会一直挂着占内存。
     # 这里每 30s 扫一遍：既无 WS 租约、又无活着 pc、且超时无活跃 → 销毁。
     _REAP_INTERVAL = 30
-    _REAP_IDLE_SECONDS = 120
+    # WS 模式断开不再立即销毁会话（避免每次重连都重新加载形象，约 11s）。
+    # 这里保留 5 分钟热会话，兼顾“下次测试秒回”和显存回收。
+    _REAP_IDLE_SECONDS = 300
 
     async def _session_reaper():
         while True:
@@ -539,6 +700,9 @@ def main():
                                     sid, session_manager.idle_seconds(sid))
                         session_manager.stop_session(sid)
                         session_manager.remove_session(sid)
+                # FLV 降级页每 5s 心跳一次；后台标签页定时器会被浏览器节流，
+                # 阈值给宽松些，避免切走一会儿就被回收（表现为“老是掉线”）。
+                await rtc_manager.reap_flv_publishers(180.0)
                 _evict_avatars()
             except Exception:
                 logger.exception("session reaper error")
@@ -555,6 +719,12 @@ def main():
     appasync.on_shutdown.append(_stop_reaper)
 
     appasync.router.add_post("/offer", offer)
+    appasync.router.add_post("/flv/publish", flv_publish)
+    appasync.router.add_post("/flv/ping", flv_ping)
+    appasync.router.add_post("/flv/unpublish", flv_unpublish)
+    appasync.router.add_get("/speedtest/ping", speedtest_ping)
+    appasync.router.add_get("/speedtest/download", speedtest_download)
+    appasync.router.add_post("/speedtest/upload", speedtest_upload)
     appasync.router.add_get("/record/{sessionid}", download_record)
     appasync.router.add_post("/warmup", warmup_avatar)
     appasync.router.add_get("/warmup/status", warmup_status)

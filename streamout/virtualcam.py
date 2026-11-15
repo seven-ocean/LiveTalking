@@ -30,7 +30,7 @@ class VirtualCamOutput(BaseOutput):
         import pyaudio
         p = pyaudio.PyAudio()
         stream = p.open(
-            rate=16000,
+            rate=32000,
             channels=1,
             format=8,
             output=True,

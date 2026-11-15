@@ -59,6 +59,12 @@ class AudioFrameData:
     data: NDArray[np.float32]
     type: int = 0  # 默认值
     userdata: dict = field(default_factory=dict)
+    # 全链路统一 16k：data 同时用于口型和播放，不再保留 32k 副本。
+    data32: NDArray[np.float32] = None
+    # 整句（utterance）元数据：TTS 整段 wav 一次性入队时标记句号与块序号，
+    # 供 MuseTalk 按整句 whisper 特征切口型条件（官方等价做法）。
+    utt_id: str = ''
+    chunk_index: int = -1
 
 class BaseAvatar:
     def __init__(self, opt):
@@ -128,14 +134,28 @@ class BaseAvatar:
         if hasattr(self, 'tts'):
             self.tts.put_msg_txt(msg, datainfo)
     
-    def put_audio_frame(self, audio_chunk:NDArray[np.float32], datainfo:dict={}): # 16khz 20ms pcm
+    def put_audio_frame(self, audio_chunk:NDArray[np.float32], datainfo:dict={},
+                        utt_id:str='', chunk_index:int=-1,
+                        data32:NDArray[np.float32]=None): # 16khz 20ms pcm
         if hasattr(self, 'asr'):
-            self.asr.put_audio_frame(audio_chunk, datainfo)
+            self.asr.put_audio_frame(audio_chunk, datainfo,
+                                     utt_id=utt_id, chunk_index=chunk_index,
+                                     data32=data32)
+
+    def _next_utt_id(self) -> str:
+        self._utt_seq = getattr(self, '_utt_seq', 0) + 1
+        sid = getattr(self, 'sessionid', '') or getattr(
+            getattr(self, 'opt', None), 'sessionid', '') or 'utt'
+        return f"{sid}-{self._utt_seq}"
 
     def put_audio_file(self, filebyte, datainfo:dict={}): 
         self.interrupted = False  # 每个新文件开始时重置
-        input_stream = BytesIO(filebyte)
-        stream = self.__create_bytes_stream(input_stream)
+        # 全链路统一 16k：一次重采样到 self.sample_rate，口型和播放共用同一份采样
+        stream = self.__create_bytes_stream(BytesIO(filebyte))
+        # 整句登记：MuseTalk 需要按整句算一次 whisper 特征（官方等价做法）
+        utt_id = self._next_utt_id()
+        if hasattr(self.asr, 'set_utterance'):
+            self.asr.set_utterance(utt_id, stream)
         streamlen = stream.shape[0]
         idx = 0
         first = True
@@ -150,14 +170,18 @@ class BaseAvatar:
                 first = False
             if streamlen - self.chunk < self.chunk:
                 eventpoint = {'status': 'end'}
-            eventpoint.update(**datainfo) 
-            self.put_audio_frame(stream[idx:idx+self.chunk], eventpoint)
+            eventpoint.update(**datainfo)
+            self.put_audio_frame(stream[idx:idx+self.chunk], eventpoint,
+                                 utt_id=utt_id, chunk_index=idx // self.chunk)
             streamlen -= self.chunk
             idx += self.chunk
 
     def put_audio_filepath(self, filepath, datainfo:dict={}): 
         self.interrupted = False  # 每个新文件开始时重置
         stream = self.__create_bytes_stream(filepath)
+        utt_id = self._next_utt_id()
+        if hasattr(self.asr, 'set_utterance'):
+            self.asr.set_utterance(utt_id, stream)
         streamlen = stream.shape[0]
         idx = 0
         first = True
@@ -172,10 +196,22 @@ class BaseAvatar:
                 first = False
             if streamlen - self.chunk < self.chunk:
                 eventpoint = {'status': 'end'}
-            eventpoint.update(**datainfo) 
-            self.put_audio_frame(stream[idx:idx+self.chunk], eventpoint)
+            eventpoint.update(**datainfo)
+            self.put_audio_frame(stream[idx:idx+self.chunk], eventpoint,
+                                 utt_id=utt_id, chunk_index=idx // self.chunk)
             streamlen -= self.chunk
             idx += self.chunk
+
+    def __create_bytes_stream32(self, byte_stream):
+        stream, sample_rate = sf.read(byte_stream)
+        logger.info(f'[INFO]put audio stream {sample_rate}: {stream.shape} (hq 32k)')
+        stream = stream.astype(np.float32)
+        if stream.ndim > 1:
+            logger.info(f'[WARN] audio has {stream.shape[1]} channels, only use the first.')
+            stream = stream[:, 0]
+        if sample_rate != 32000 and stream.shape[0] > 0:
+            stream = resampy.resample(x=stream, sr_orig=sample_rate, sr_new=32000)
+        return stream
     
     def __create_bytes_stream(self, byte_stream):
         stream, sample_rate = sf.read(byte_stream) # [T*sample_rate,] float64
@@ -317,7 +353,7 @@ class BaseAvatar:
                     '-y', '-vn',
                     '-f', 's16le',
                     '-ac', '1',
-                    '-ar', '16000',
+                    '-ar', '32000',
                     '-i', '-',
                     '-acodec', 'aac',
                     f'temp{self.opt.sessionid}.aac']
@@ -435,8 +471,32 @@ class BaseAvatar:
                 except Exception:
                     logger.exception('resolve feat batch failed, treating as silence')
                     audiofeat_batch = None
-                # 防御：特征批次不匹配（或解析失败）时按静音处理，防止 flush_talk 后
-                # feat_queue/output_queue 清空不彻底导致 shape mismatch 崩溃
+                # 防御：特征批次不完整（flush/reconnect 时常见）不要整轮当静音，
+                # 否则说话首尾会掉口型。短则用最后一帧补齐，长则截断。
+                if audiofeat_batch is not None:
+                    if hasattr(audiofeat_batch, 'detach'):
+                        audiofeat_batch = audiofeat_batch.detach().cpu().numpy()
+                    try:
+                        _got = len(audiofeat_batch)
+                    except TypeError:
+                        _got = None
+                    if _got == 0:
+                        audiofeat_batch = None
+                    elif _got is not None and _got < self.batch_size:
+                        _arr = np.asarray(audiofeat_batch)
+                        _pad = self.batch_size - _got
+                        _last = _arr[-1:]
+                        audiofeat_batch = np.concatenate(
+                            [_arr, np.repeat(_last, _pad, axis=0)], axis=0
+                        )
+                        logger.warning(
+                            f'[WARN] audio feat short: got {_got}, padded to {self.batch_size}'
+                        )
+                    elif _got is not None and _got > self.batch_size:
+                        audiofeat_batch = np.asarray(audiofeat_batch)[:self.batch_size]
+                        logger.warning(
+                            f'[WARN] audio feat long: got {_got}, truncated to {self.batch_size}'
+                        )
                 if audiofeat_batch is None or len(audiofeat_batch) != self.batch_size:
                     _got = None if audiofeat_batch is None else len(audiofeat_batch)
                     logger.warning(f'[WARN] audio feat batch size mismatch: got {_got}, expected {self.batch_size}. Treating as silence.')
@@ -457,7 +517,25 @@ class BaseAvatar:
                     index = 0
                 t = time.perf_counter()
 
-                pred = self.inference_batch(index, audiofeat_batch)
+                try:
+                    pred = self.inference_batch(index, audiofeat_batch)
+                except Exception:
+                    # 单批推理失败（最常见是 CUDA OOM）不能让推理线程退出，
+                    # 否则画面会永久停在最后一帧；这里释放缓存并退回静态帧继续播放。
+                    logger.exception('inference_batch 失败，本批退回静态帧')
+                    self.__dict__.pop('_prev_frame_latent', None)
+                    try:
+                        import torch as _torch
+                        if _torch.cuda.is_available():
+                            _torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    for i in range(self.batch_size):
+                        sidx = mirror_index(length, index)
+                        self.res_frame_queue.put(
+                            (None, audio_frames[i*2:i*2+2], sidx))
+                        index = index + 1
+                    continue
 
                 counttime += (time.perf_counter() - t)
                 count += self.batch_size
@@ -547,7 +625,7 @@ class BaseAvatar:
             self.record_video_data(combine_frame)
 
             for audio_frame in audio_frames:
-                #frame,type,eventpoint = audio_frame
+                # 全链路统一 16k：播放通道直接使用 16k 采样，不再升到 32k 再降回来
                 frame = (audio_frame.data * 32767).astype(np.int16)
 
                 # 使用统一输出接口推送音频帧
@@ -589,8 +667,14 @@ class BaseAvatar:
                 break
 
             # 产出节拍：一轮 = batch_size 帧 = batch_size/fps 秒的视频（25fps、batch16 → 640ms）。
-            # 必须按**时间**节流而不是按 RTP 队列深度：ICE 未连通时（真实环境降级到 WS 就是这个
-            # 状态）RTP 队列没有消费者、恒满，按队列深度会白睡数秒 → 产出掉到 5fps 且成突发。
+            # 必须按**时间**节流，而且**不能**按输出队列深度做背压：
+            #   • asr.run_step() 一次就消费 batch_size*2 个音频帧（= batch_size*40ms 音频），
+            #     所以一轮天然对应 640ms 的实时内容；
+            #   • process_frames 是**整批突发**写队列的（16 帧一次性入队），任何「队列深度 >= 5
+            #     就睡」的公式都会在正常突发时误睡 0.5s，把产出压到 13fps 以下 —— 音频内容
+            #     随之少于实时（40ms/帧），客户端就会周期性断音、画面一顿一顿。
+            # 音画对齐不靠这里，而是靠传输层的 seq 门控：音频必须等对应视频帧真的发出去，
+            # 视频慢时音频跟着等，绝不抢跑。
             _deadline += _round_interval
             _now = time.monotonic()
             if _deadline > _now:

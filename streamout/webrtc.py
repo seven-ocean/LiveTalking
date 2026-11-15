@@ -35,6 +35,10 @@ class WebRTCOutput(BaseOutput):
 
 
     def get_buffer_size(self) -> int:
+        # 优先用「活跃消费者」的积压：只有真正在取帧的通道（WebRTC 轨 / WS / FLV）才算，
+        # 避免 ICE 未连通时空跑的 RTP 队列把渲染线程误节流。
+        if self._player and hasattr(self._player, 'get_active_backlog'):
+            return self._player.get_active_backlog()
         if self._player and hasattr(self._player, 'get_buffer_size'):
             return self._player.get_buffer_size()
         return 0

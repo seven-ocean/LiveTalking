@@ -16,17 +16,23 @@
 ###############################################################################
 
 import asyncio
+import base64
 import json
 import os
 import time
 
 import cv2
 import numpy as np
+import resampy
 from aiohttp import WSMsgType, web
 
 from server.session_manager import session_manager
 from server.webrtc import HumanPlayer
+from server.ws_h264 import BIN_H264, H264Encoder
 from utils.logger import logger
+
+# JPEG 编码/缩放已经很小，OpenCV 再开多线程只会和推理线程抢核
+cv2.setNumThreads(1)
 
 
 def _env_int(name: str, default: int) -> int:
@@ -36,15 +42,35 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-# JPEG 质量：流畅优先（分辨率保持原始帧，不做缩放；可配 WS_VIDEO_JPEG_QUALITY）
-JPEG_QUALITY = _env_int("WS_VIDEO_JPEG_QUALITY", 80)
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+# 默认走 H.264（独立 x264 进程 + 客户端 WebCodecs 硬解），尺度 0.75 = 540x960；
+# 不支持 WebCodecs 的浏览器回落 JPEG（以下参数用于该兜底路径）。
+JPEG_QUALITY = _env_int("WS_VIDEO_JPEG_QUALITY", 60)
+VIDEO_SCALE = _env_float("WS_VIDEO_SCALE", 0.75)
+VIDEO_BITRATE = _env_int("WS_VIDEO_BITRATE", 2_000_000)
+# 可选：WS 降级通道单独限制帧率（0=跟随数字人 25fps）。低配客户端可用 20 换取稳定。
+WS_FPS = _env_int("WS_VIDEO_FPS", 0)
 DEFAULT_W, DEFAULT_H, DEFAULT_FPS = 256, 256, 25
 # 等首帧的超时：形象冷加载可能较久，这里只在渲染线程已能出帧时才会很快返回
 FIRST_FRAME_TIMEOUT = 20.0
 MAX_WS_MSG = 8 * 1024 * 1024
+# 单次 WS 写入的超时。客户端掉线（尤其是半开连接：TCP 已断但没有 FIN/RST）时，
+# send_bytes 会一直卡在写满的发送缓冲上，整个 handler 永远进不了 finally ——
+# 表现为编码进程和渲染线程一直泄漏、后台持续吃 CPU。
+WS_SEND_TIMEOUT = 5.0
 
 BIN_JPEG = 0x01
 BIN_PCM = 0x02
+
+# 静态帧跳过：待机时画面几乎不变，没必要每帧都编 JPEG。用缩小图的平均绝对差判断，
+# 成本约 0.1ms（对比 ~8ms 的 JPEG 编码），待机 CPU 能降一大截。
+STATIC_DIFF_THRESHOLD = 1.2
 
 
 def _player_of(sessionid):
@@ -66,6 +92,7 @@ def _latest_session_with_player():
 
 async def ws_video(request: web.Request) -> web.WebSocketResponse:
     query_sid = (request.query.get("sessionid") or "").strip()
+    want_h264 = (request.query.get("codec") or "jpeg").lower() == "h264"
 
     sessionid, avatar_session, player = (None, None, None)
     if query_sid:
@@ -105,6 +132,13 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
     video_slot = player.ws_video_slot()
     audio_slot = player.ws_audio_slot()
 
+    # 复用会话时队列里可能还压着上一轮的数据（视频最多 32 帧、音频最多 500×20ms）。
+    # 不清掉的话，新连接一上来就播旧画面/旧声音 → 音画错位、追赶式卡顿。
+    _stale_v = video_slot.clear() if hasattr(video_slot, 'clear') else 0
+    _stale_a = audio_slot.clear() if hasattr(audio_slot, 'clear') else 0
+    if _stale_v or _stale_a:
+        logger.info("ws_video: 清空上一轮残留 视频%d 音频%d", _stale_v, _stale_a)
+
     ws = web.WebSocketResponse(heartbeat=30.0, max_msg_size=MAX_WS_MSG, autoping=True)
     await ws.prepare(request)
     logger.info("ws_video: client connected, sessionid=%s reused=%s", sessionid, not own_session)
@@ -112,42 +146,60 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
 
     send_lock = asyncio.Lock()
 
+    async def abort_ws(reason: str) -> None:
+        """发送失败/超时：强制关掉连接，让接收循环立刻退出并走 finally 收尾。"""
+        logger.warning("ws_video: %s，强制关闭连接 sessionid=%s", reason, sessionid)
+        try:
+            await asyncio.wait_for(ws.close(), 1.0)
+        except Exception:
+            pass
+        tr = request.transport
+        if tr is not None:
+            try:
+                tr.close()
+            except Exception:
+                pass
+
     async def send_bytes(payload: bytes) -> None:
         async with send_lock:
-            if not ws.closed:
-                await ws.send_bytes(payload)
+            if ws.closed:
+                return
+            try:
+                await asyncio.wait_for(ws.send_bytes(payload), WS_SEND_TIMEOUT)
+            except asyncio.TimeoutError:
+                await abort_ws("发送超时（客户端可能已掉线）")
+            except (ConnectionResetError, ConnectionError, RuntimeError) as exc:
+                await abort_ws("发送失败: %r" % (exc,))
 
     async def send_json(obj: dict) -> None:
         async with send_lock:
-            if not ws.closed:
-                await ws.send_str(json.dumps(obj))
-
-    def encode_jpeg(bgr) -> bytes:
-        ok, buf = cv2.imencode(
-            ".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
-        )
-        if not ok:
-            return b""
-        return bytes((BIN_JPEG,)) + buf.tobytes()
+            if ws.closed:
+                return
+            try:
+                await asyncio.wait_for(ws.send_str(json.dumps(obj)), WS_SEND_TIMEOUT)
+            except asyncio.TimeoutError:
+                await abort_ws("发送超时（客户端可能已掉线）")
+            except (ConnectionResetError, ConnectionError, RuntimeError) as exc:
+                await abort_ws("发送失败: %r" % (exc,))
 
     # ── 先取一帧确定分辨率（同时会拉起渲染线程），再发 ready ──
-    first_bgr = None
+    first_frame = None
     _t0 = time.monotonic()
     while time.monotonic() - _t0 < FIRST_FRAME_TIMEOUT:
-        _f = video_slot.pop()
-        if _f is not None:
-            try:
-                first_bgr = _f.to_ndarray(format="bgr24")
-            except Exception:
-                first_bgr = None
-            if first_bgr is not None:
-                break
+        _item = video_slot.pop()
+        _f, _seq = _item if isinstance(_item, tuple) else (_item, -1)
+        if _f is not None and _f.width and _f.height:
+            first_frame = _f
+            # 首帧会直接喂给编码器，视频「已发出」序号先推进到它
+            if _seq >= 0 and _seq > player.ws_video_sent_seq:
+                player.ws_video_sent_seq = _seq
+            break
         if ws.closed:
             return ws
         await asyncio.sleep(0.01)
 
-    if first_bgr is not None:
-        fh, fw = first_bgr.shape[:2]
+    if first_frame is not None:
+        fh, fw = first_frame.height, first_frame.width
     else:
         # 拿不到首帧时不能用 256×256 占位（前端会按它裁画面 → 用户完全看不到内容），
         # 退回到该形象的**真实帧尺寸**。
@@ -161,17 +213,87 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
         logger.warning("ws_video: 未取到首帧，按形象真实尺寸上报 %dx%d（渲染线程刚启动时会这样，前端可从后续帧自校正）",
                        fw, fh)
 
-    fps = int(getattr(request.app.get("opt"), "fps", None) or DEFAULT_FPS)
+    fps = WS_FPS or int(getattr(request.app.get("opt"), "fps", None) or DEFAULT_FPS)
     frame_interval = 1.0 / max(1, fps)
-    await send_json({
+    if VIDEO_SCALE and abs(VIDEO_SCALE - 1.0) > 0.01:
+        fw = max(2, int(round(fw * VIDEO_SCALE)))
+        fh = max(2, int(round(fh * VIDEO_SCALE)))
+
+    # 帧本来就是从 BGR ndarray 建的（HumanPlayer.push_video），to_ndarray 是零拷贝视图；
+    # 缩放用 cv2.resize（0.3ms），比 libswscale 的 reformat（约 4ms）快一个数量级。
+    thumb_w = max(8, fw // 12)
+    thumb_h = max(8, fh // 12)
+    last_thumb = [None]
+
+    def encode_jpeg(frame) -> bytes:
+        """把一帧转成 WS 二进制消息；画面几乎没变化时返回空（跳过编码）。"""
+        try:
+            bgr = frame.to_ndarray(format="bgr24")
+        except Exception:
+            return b""
+        if bgr is None or bgr.size == 0:
+            return b""
+        if bgr.shape[1] != fw or bgr.shape[0] != fh:
+            bgr = cv2.resize(bgr, (fw, fh), interpolation=cv2.INTER_AREA)
+
+        small = cv2.resize(bgr, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
+        prev = last_thumb[0]
+        if prev is not None and cv2.absdiff(small, prev).mean() < STATIC_DIFF_THRESHOLD:
+            return b""
+        last_thumb[0] = small
+
+        ok, buf = cv2.imencode(
+            ".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+        )
+        if not ok:
+            return b""
+        return bytes((BIN_JPEG,)) + buf.tobytes()
+
+    h264 = None
+    if want_h264:
+        try:
+            loop = asyncio.get_running_loop()
+            h264 = H264Encoder(int(fw), int(fh), fps=fps, bitrate=VIDEO_BITRATE)
+            h264.start(loop)
+            h264.on_exit = lambda: loop.call_soon_threadsafe(
+                lambda: asyncio.ensure_future(ws.close())
+            )
+            if first_frame is not None:
+                h264.push_frame(first_frame)
+            ok = await loop.run_in_executor(None, h264.wait_ready, 5.0)
+            if not ok:
+                raise RuntimeError("H.264 编码器 5s 内未输出 SPS/PPS")
+        except Exception:
+            logger.exception("ws_video: H.264 启动失败，回落 JPEG")
+            if h264 is not None:
+                try:
+                    h264.stop()
+                except Exception:
+                    pass
+            h264 = None
+
+    ready = {
         "type": "ready",
         "sessionid": sessionid,
+        "codec": "h264" if h264 is not None else "jpeg",
         "video": {"w": int(fw), "h": int(fh), "fps": fps},
         "audio": {"rate": 16000, "channels": 1, "format": "s16le"},
-    })
+    }
+    if h264 is not None:
+        ready["video"].update({
+            "codec": h264.codec_string,
+            "avcC": base64.b64encode(h264.avcc).decode("ascii"),
+        })
+    await send_json(ready)
+    if h264 is not None:
+        logger.info("ws_video: ready %dx%d @%d fps，H.264 %s %d bps，音频 16000 Hz",
+                    int(fw), int(fh), fps, h264.codec_string, VIDEO_BITRATE)
+    else:
+        logger.info("ws_video: ready %dx%d @%d fps，JPEG 质量 %d，音频 16000 Hz",
+                    int(fw), int(fh), fps, JPEG_QUALITY)
 
-    if first_bgr is not None:
-        data = encode_jpeg(first_bgr)
+    if h264 is None and first_frame is not None:
+        data = await asyncio.to_thread(encode_jpeg, first_frame)
         if data:
             await send_bytes(data)
 
@@ -185,53 +307,145 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
         2. **按 fps 节拍**：原实现完全不节流，产出抖动会被原样暴露成卡顿，
            且慢客户端下帧量可失控（实测能跑到数千 fps 并把进程 OOM）。
         """
-        next_tick = time.monotonic()
+        # 与上游 PlayerStreamTrack.next_timestamp 同一套模型：每个槽位对应绝对墙钟时间
+        # （start + slot*interval）。落后时**丢帧追时间**，绝不把时间轴拉长——否则视频
+        # 会比音频慢，表现为慢动作、口型越说越对不上。
+        start = time.monotonic()
+        slot = 0
         n = 0
+        enc_ms = send_ms = 0.0
+        dropped = 0
+        skipped = 0
         while not ws.closed:
-            frame = video_slot.pop()
+            item = video_slot.pop()
+            frame, seq = item if isinstance(item, tuple) else (item, -1)
+            now = time.monotonic()
+            if now - (start + slot * frame_interval) > 1.0:
+                slot = int((now - start) / frame_interval)
+
+            target = start + slot * frame_interval
+            if now < target:
+                await asyncio.sleep(target - now)
+
             if frame is None:
-                # 队列空（这一批还没来）：不积累节拍，避免下一批到达后补发式突发
-                await asyncio.sleep(0.003)
-                next_tick = time.monotonic()
+                slot += 1
                 continue
 
-            now = time.monotonic()
-            if now < next_tick:
-                await asyncio.sleep(next_tick - now)
-            elif now - next_tick > 1.0:
-                next_tick = now              # 落后超过 1s 重新对齐，避免越睡越慢
-            next_tick += frame_interval
+            slot += 1
 
+            t_enc = time.monotonic()
             try:
-                bgr = await asyncio.to_thread(frame.to_ndarray, "bgr24")
-                data = await asyncio.to_thread(encode_jpeg, bgr)
+                data = await asyncio.to_thread(encode_jpeg, frame)
             except Exception:
                 logger.exception("ws_video: encode failed")
                 continue
-            if not data:
-                continue
+            enc_ms += (time.monotonic() - t_enc) * 1000
+            if data:
+                t_send = time.monotonic()
+                await send_bytes(data)
+                send_ms += (time.monotonic() - t_send) * 1000
+            else:
+                # 画面几乎没变：跳过编码和发送，客户端保留上一帧
+                skipped += 1
+            # 无论发没发数据（静态帧客户端保留上一帧，画面等效），这一帧的时间点都已经到了
+            if seq >= 0 and seq > player.ws_video_sent_seq:
+                player.ws_video_sent_seq = seq
 
-            t_send = time.monotonic()
-            await send_bytes(data)
-            if time.monotonic() - t_send > frame_interval * 2:
-                # 发送耗时超过两拍 → 网络已回压，重排节拍（队列本身已在丢最旧帧）
-                next_tick = time.monotonic() + frame_interval
+            # CPU/事件循环抖动导致落后时，不丢帧，直接把槽位对齐到当前时间，
+            # 避免“越睡越慢”或大批丢帧（丢帧会让画面一顿一顿）。
+            if time.monotonic() - target > frame_interval:
+                slot = int((time.monotonic() - start) / frame_interval) + 1
 
             n += 1
             if n % 250 == 0:
-                logger.info("[ws] 已推送 %d 帧（队列积压 %d，目标 %d fps）",
-                            n, video_slot.qsize(), fps)
+                logger.info("[ws] 处理 %d 帧 编码%.1fms 发送%.1fms 跳过%d 积压%d 目标%d fps",
+                            n, enc_ms / 250, send_ms / 250, skipped,
+                            video_slot.qsize(), fps)
+                enc_ms = send_ms = 0.0
+                skipped = 0
+                dropped = 0
 
     async def pump_audio() -> None:
+        # 与上游 AUDIO_PTIME=20ms 一致：每条 PCM 按时钟逐帧发送。
+        # 不节拍的话，TTS 整段音频会瞬间灌满 socket 并长时间占住 send_lock，
+        # 视频 pump 排不上队 → 大面积丢帧（实测丢 30%+）。
+        ptime = 0.02
+        a_start = time.monotonic()
+        a_slot = 0
+        pending = None  # 已取出、但对应视频还没发出去的那段音频
+        silence = bytes((BIN_PCM,)) + b"\x00" * 320 * 2
         while not ws.closed:
-            frame = audio_slot.pop()
-            if frame is None:
-                await asyncio.sleep(0.005)
+            if pending is None:
+                item = audio_slot.pop()
+                if item is not None:
+                    pending = item if isinstance(item, tuple) else (item, -1)
+            if pending is None:
+                await asyncio.sleep(0.002)
                 continue
-            pcm = frame.to_ndarray().astype(np.int16).tobytes()
-            await send_bytes(bytes((BIN_PCM,)) + pcm)
 
-    tasks = [asyncio.ensure_future(pump_video()), asyncio.ensure_future(pump_audio())]
+            now = time.monotonic()
+            target = a_start + a_slot * ptime
+            if now < target:
+                await asyncio.sleep(target - now)
+            elif now - target > 1.0:
+                a_slot = int((now - a_start) / ptime)
+            a_slot += 1
+
+            frame, seq = pending
+            if seq >= 0:
+                # 门控：这段音频对应的视频帧必须先发出去。视频落后时最多等 200ms，
+                # 超时就用静音占住当前 20ms 槽位（而不是丢掉音频）——宁可声音稍晚，
+                # 也不能让声音跑到口型前面。pending 保留，下个槽位继续等。
+                deadline = time.monotonic() + 0.2
+                while player.ws_video_sent_seq < seq and time.monotonic() < deadline:
+                    await asyncio.sleep(0.005)
+                if player.ws_video_sent_seq < seq:
+                    await send_bytes(silence)
+                    continue
+
+            # 全链路统一 16k（server/webrtc.py SAMPLE_RATE=16000），直接发送，不再重采样
+            arr = frame.to_ndarray()
+            pcm = arr.tobytes() if arr.dtype == np.int16 else arr.astype(np.int16).tobytes()
+            await send_bytes(bytes((BIN_PCM,)) + pcm)
+            pending = None
+
+    async def pump_h264_feed() -> None:
+        """按 25fps 从 WS 帧源取帧喂给编码器；编码在独立 ffmpeg 进程里，不占事件循环。"""
+        start = time.monotonic()
+        slot = 0
+        while not ws.closed:
+            item = video_slot.pop()
+            frame, seq = item if isinstance(item, tuple) else (item, -1)
+            target = start + slot * frame_interval
+            now = time.monotonic()
+            if now < target:
+                await asyncio.sleep(target - now)
+            slot += 1
+            if frame is None:
+                continue
+            h264.push_frame(frame, seq)
+            if time.monotonic() - target > 1.0:  # 落后太多：重新对齐
+                start = time.monotonic()
+                slot = 0
+
+    async def send_h264() -> None:
+        while not ws.closed:
+            item = await h264.next_au()
+            key, au, seq = item if len(item) == 3 else (item[0], item[1], -1)
+            await send_bytes(bytes((BIN_H264, 1 if key else 0)) + au)
+            # 真正写进 socket 之后才算「视频已发出」，音频门控以此为准
+            if seq >= 0 and seq > player.ws_video_sent_seq:
+                player.ws_video_sent_seq = seq
+
+    player.ws_active = True
+    if h264 is not None:
+        tasks = [
+            asyncio.ensure_future(pump_h264_feed()),
+            asyncio.ensure_future(send_h264()),
+            asyncio.ensure_future(pump_audio()),
+        ]
+    else:
+        tasks = [asyncio.ensure_future(pump_video()), asyncio.ensure_future(pump_audio())]
     try:
         async for msg in ws:
             if msg.type == WSMsgType.TEXT:
@@ -251,6 +465,13 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        player.ws_active = False
+        if h264 is not None:
+            try:
+                # stop 里要 terminate + join 线程，放线程池执行，别卡住事件循环
+                await asyncio.get_running_loop().run_in_executor(None, h264.stop)
+            except Exception:
+                logger.debug("ws_video: h264.stop failed", exc_info=True)
         # 收尾：没有 aiortc 轨道在消费时停掉渲染线程，避免断连后线程泄漏
         try:
             player.release_worker()
@@ -261,30 +482,14 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
             session_manager.stop_session(sessionid)
             session_manager.remove_session(sessionid)
         else:
-            # pc 若已因 ICE 失败销毁过该会话，release 会返回 True → 这里补做清理
-            _pending = session_manager.release_session(sessionid)
-            # 关键补漏：ICE 一直卡在 checking 时 pc **永远不会**变成 failed，
-            # 原有「pc 失败即清理」路径因此永不触发 → 浏览器关掉后会话一直留着占内存
-            # （实测用户关掉两路后仍有 2 个 session）。所以这里主动判定：
-            # WS 已断开且该会话已无任何活着的 pc → 立即销毁。
-            _rtc = request.app.get("rtc_manager")
-            _no_live_pc = True
-            if _rtc is not None:
-                try:
-                    _no_live_pc = not _rtc.session_has_live_pc(sessionid, require_connected=True)
-                except Exception:
-                    logger.debug("ws_video: session_has_live_pc failed", exc_info=True)
-                    _no_live_pc = False
-            if _pending or _no_live_pc:
-                logger.info("ws_video: 回收会话 sessionid=%s（pending=%s, no_live_pc=%s）",
-                            sessionid, _pending, _no_live_pc)
-                session_manager.stop_session(sessionid)
-                session_manager.remove_session(sessionid)
-                if _rtc is not None:
-                    try:
-                        await _rtc.drop_session_pcs(sessionid)
-                    except Exception:
-                        logger.debug("ws_video: drop_session_pcs failed", exc_info=True)
+            # 只释放 WS 租约，**不立即销毁会话**：
+            #   1. WS 模式下 pc 因 UDP 被封必然 failed，断开后重连或下一次测试应复用
+            #      已加载的形象模型；立即销毁会导致每次重连都重新加载（实测约 11s，
+            #      表现为“发完文字半天不回复”）。
+            #   2. 泄漏由 app.py 的空闲回收任务兜底（无租约、无活 pc、空闲超时）。
+            session_manager.release_session(sessionid)
+            session_manager.touch(sessionid)
+            logger.info("ws_video: 会话保留待复用 sessionid=%s", sessionid)
         logger.info("ws_video: client disconnected, sessionid=%s", sessionid)
 
     return ws

@@ -141,6 +141,7 @@ class LightReal(BaseAvatar):
         self.asr = HubertASR(opt,self,audio_processor,audio_feat_length=[4,4])
         self.asr.warm_up()
 
+    @torch.no_grad()
     def inference_batch(self, index, audiofeat_batch):
         # 这里的 index 是针对当前 avatar 的索引
         # 返回一个 batch 的推理结果，batch 大小由 self.batch_size 决定

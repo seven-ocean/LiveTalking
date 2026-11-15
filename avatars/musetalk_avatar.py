@@ -33,6 +33,7 @@ import copy
 
 import queue
 from queue import Queue
+import threading
 from threading import Thread, Event
 import torch.multiprocessing as mp
 
@@ -55,13 +56,37 @@ from registry import register
 device = initialize_device()
 logger.info('Using {} for inference.'.format(device))
 
+# ── 嘴部抖动 / 数值精度相关开关（环境变量，默认保持原行为，便于线上 A/B）──
+# MUSETALK_MOUTH_SMOOTH: 帧间 latent EMA 强度 0~0.9，0=关闭（推荐 0.3~0.4）
+# MUSETALK_LATENT_CLAMP: latent 裁剪阈值，0=不裁剪（原行为 3.5）
+# MUSETALK_VAE_FP32: 1=VAE 用 float32 解码（牺牲速度换取更稳定的嘴部像素）
+# MUSETALK_DEBUG_LATENT: 1=记录每批 latent 触边比例，供抖动分析
+_MOUTH_SMOOTH = min(0.9, max(0.0, float(os.getenv('MUSETALK_MOUTH_SMOOTH', '0') or 0)))
+_LATENT_CLAMP = float(os.getenv('MUSETALK_LATENT_CLAMP', '3.5') or 0)
+_DEBUG_LATENT = os.getenv('MUSETALK_DEBUG_LATENT', '0') == '1'
+_VAE_FP32 = os.getenv('MUSETALK_VAE_FP32', '0') == '1'
+# VAE 解码子批大小：16 帧一次性解码在 31GB 显存配额上峰值可达 20GB+，
+# 多路会话叠加必 OOM（画面卡死）；切成小批串行解码，峰值按比例下降。
+_VAE_CHUNK = max(1, int(os.getenv('MUSETALK_VAE_CHUNK', '4') or 4))
+
+# 全局推理锁：多路会话同时跑 MuseTalk 时，UNet+VAE 的峰值显存会叠加，
+# 在 31GB 显存配额下极易 OOM（表现为画面卡死）。串行化后单批仍是百毫秒级，不影响 25fps。
+_INFER_LOCK = threading.Lock()
+if _MOUTH_SMOOTH > 0 or _LATENT_CLAMP != 3.5 or _VAE_FP32:
+    logger.info(
+        "MuseTalk jitter knobs: smooth=%.2f clamp=%.2f vae_fp32=%s",
+        _MOUTH_SMOOTH, _LATENT_CLAMP, _VAE_FP32,
+    )
+
 def load_model():
     # load model weights
     vae, unet, pe = load_all_model()
     #device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()) else "cpu"))
     timesteps = torch.tensor([0], device=device)
     pe = pe.half().to(device)
-    vae.vae = vae.vae.half().to(device)
+    # VAE 精度：默认 fp16（快）；MUSETALK_VAE_FP32=1 时用 fp32 解码，
+    # 用于排查 MACA fp16 在低能量音频下嘴部像素抖动的问题。
+    vae.vae = vae.vae.float().to(device) if _VAE_FP32 else vae.vae.half().to(device)
     unet.model = unet.model.half().to(device)
     # Initialize audio processor and Whisper model
     audio_processor = Audio2Feature(model_path="./models/musetalk/whisper")
@@ -306,6 +331,7 @@ class MuseReal(BaseAvatar):
         self.asr.warm_up()
     
 
+    @torch.no_grad()
     def inference_batch(self, index, audiofeat_batch):
         # 这里的 index 是针对当前 avatar 的索引
         # 返回一个 batch 的推理结果，batch 大小由 self.batch_size 决定
@@ -331,21 +357,73 @@ class MuseReal(BaseAvatar):
         latent_batch = latent_batch.to(dtype=self.unet.model.dtype)
         t3 = time.time()
 
-        pred_latents = self.unet.model(latent_batch, 
-                                    self.timesteps, 
-                                    encoder_hidden_states=audio_feature_batch).sample
-        t4 = time.time()
+        if _DEBUG_LATENT:
+            try:
+                logger.info(
+                    "[mem] infer start allocated=%.2fGB reserved=%.2fGB max=%.2fGB",
+                    torch.cuda.memory_allocated() / 1e9,
+                    torch.cuda.memory_reserved() / 1e9,
+                    torch.cuda.max_memory_allocated() / 1e9)
+            except Exception:
+                pass
+        with _INFER_LOCK:
+            pred_latents = self.unet.model(latent_batch, 
+                                        self.timesteps, 
+                                        encoder_hidden_states=audio_feature_batch).sample
+            t4 = time.time()
         
-        # 安全裁剪: 防止 MetaX GPU 上 latent 异常值导致 VAE 解码画面模糊
-        pred_latents = torch.clamp(pred_latents, -3.5, 3.5)
+            # 安全裁剪: 防止 MetaX GPU 上 latent 异常值导致 VAE 解码画面模糊。
+            # 阈值可用 MUSETALK_LATENT_CLAMP 覆盖（0=关闭），用于验证裁剪是否放大嘴部抖动。
+            if _LATENT_CLAMP > 0:
+                if _DEBUG_LATENT:
+                    self._last_clamp_ratio = round(
+                        float((pred_latents.abs() > _LATENT_CLAMP).float().mean().item()), 4)
+                pred_latents = torch.clamp(pred_latents, -_LATENT_CLAMP, _LATENT_CLAMP)
+            else:
+                self._last_clamp_ratio = 0.0
+
+            # 帧间平滑：低能量音频时 UNet 输出方差大，嘴部会高频颤动。
+            # 对 latent 做逐帧 EMA（注意必须按帧顺序，不能按 batch 位置跨批混叠），
+            # 静音/长时间无推理后自动重置，避免新一轮说话开头被上一段拖影。
+            if _MOUTH_SMOOTH > 0:
+                now = time.time()
+                if now - getattr(self, '_prev_latent_ts', 0.0) > 1.0:
+                    self._prev_frame_latent = None
+                smoothed = []
+                prev = getattr(self, '_prev_frame_latent', None)
+                for i in range(pred_latents.shape[0]):
+                    cur = pred_latents[i:i + 1]
+                    if prev is not None:
+                        cur = prev * _MOUTH_SMOOTH + cur * (1.0 - _MOUTH_SMOOTH)
+                    smoothed.append(cur)
+                    prev = cur
+                pred_latents = torch.cat(smoothed, dim=0)
+                self._prev_frame_latent = prev
+                self._prev_latent_ts = now
         
-        # DEBUG: 检查 pred_latents 的统计信息
-        if index % 30 == 0:
-            logger.info(f"[DEBUG] pred_latents shape: {pred_latents.shape}, dtype: {pred_latents.dtype}")
-            logger.info(f"[DEBUG] pred_latents range: [{pred_latents.min():.4f}, {pred_latents.max():.4f}], mean: {pred_latents.mean():.4f}")
+            # DEBUG: 检查 pred_latents 的统计信息
+            if index % 30 == 0:
+                logger.info(f"[DEBUG] pred_latents shape: {pred_latents.shape}, dtype: {pred_latents.dtype}")
+                logger.info(f"[DEBUG] pred_latents range: [{pred_latents.min():.4f}, {pred_latents.max():.4f}], mean: {pred_latents.mean():.4f}")
         
-        pred = self.vae.decode_latents(pred_latents)
-        t5 = time.time()
+            if pred_latents.shape[0] > _VAE_CHUNK:
+                parts = []
+                for start in range(0, pred_latents.shape[0], _VAE_CHUNK):
+                    parts.append(self.vae.decode_latents(
+                        pred_latents[start:start + _VAE_CHUNK]))
+                pred = np.concatenate(parts, axis=0)
+            else:
+                pred = self.vae.decode_latents(pred_latents)
+            t5 = time.time()
+            if _DEBUG_LATENT:
+                try:
+                    logger.info(
+                        "[mem] after vae allocated=%.2fGB reserved=%.2fGB max=%.2fGB",
+                        torch.cuda.memory_allocated() / 1e9,
+                        torch.cuda.memory_reserved() / 1e9,
+                        torch.cuda.max_memory_allocated() / 1e9)
+                except Exception:
+                    pass
         
         # 打印性能分析（每10帧打印一次）
         if index % 10 == 0:

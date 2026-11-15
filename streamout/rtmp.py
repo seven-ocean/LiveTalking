@@ -55,10 +55,8 @@ class RTMPOutput(BaseOutput):
         sc.stream_profile = 'main'
         sc.audio_channel = 1
         
-        sc.sample_rate = getattr(self.opt, 'sample_rate', 16000)
-        if self.parent:
-            sc.sample_rate = self.parent.sample_rate
-            
+        sc.sample_rate = 32000
+        
         sc.stream_server = self.push_url
 
         self._streamer = Streamer()

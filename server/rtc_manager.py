@@ -4,8 +4,10 @@
 
 import json
 import asyncio
+import os
 import random
 import copy
+import re
 import time
 from typing import Dict, Optional, List
 import queue
@@ -14,11 +16,72 @@ from aiohttp import web
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceServer, RTCConfiguration
 from aiortc.rtcrtpsender import RTCRtpSender
 
+# aiortc 默认码率是按“窄带会议”设的（H264 1Mbps / VP8 500kbps），
+# 对 720p/1080p 数字人画面明显偏低，表现为静态待机时画面发糊、细节丢失。
+# 这里在进程内把默认/下限/上限码率抬到适合数字人的范围（无需改第三方包文件）：
+#   - 默认值决定刚建连、REMB 还没上来时的清晰度；
+#   - 下限值防止浏览器早期 REMB 偏低时把画面压糊（可用环境变量下调）。
+try:
+    from aiortc.codecs import h264 as _h264
+    from aiortc.codecs import vpx as _vpx
+    _h264.DEFAULT_BITRATE = int(os.environ.get("ZL_WEBRTC_H264_BITRATE", "6000000"))
+    _h264.MIN_BITRATE = int(os.environ.get("ZL_WEBRTC_H264_MIN_BITRATE", "4000000"))
+    _h264.MAX_BITRATE = int(os.environ.get("ZL_WEBRTC_H264_MAX_BITRATE", "12000000"))
+    _vpx.DEFAULT_BITRATE = int(os.environ.get("ZL_WEBRTC_VP8_BITRATE", "4000000"))
+    _vpx.MIN_BITRATE = int(os.environ.get("ZL_WEBRTC_VP8_MIN_BITRATE", "3000000"))
+    _vpx.MAX_BITRATE = int(os.environ.get("ZL_WEBRTC_VP8_MAX_BITRATE", "8000000"))
+    print(
+        "[webrtc] video bitrate: h264=%d/%d/%d vp8=%d/%d/%d (default/min/max)"
+        % (_h264.DEFAULT_BITRATE, _h264.MIN_BITRATE, _h264.MAX_BITRATE,
+           _vpx.DEFAULT_BITRATE, _vpx.MIN_BITRATE, _vpx.MAX_BITRATE)
+    )
+except Exception:
+    pass
+
 from utils.logger import logger, get_webrtc_logger
 from utils.hardware_monitor import log_resource_snapshot
 
 
 webrtc_log = get_webrtc_logger()
+
+# 云主机/NAT 部署时，aiortc 的 host 候选是私网 IP，浏览器无法直连。
+# 设置 ZL_PUBLIC_IP 后，把 answer SDP 中 host 候选和 c= 行的 IP 改写成公网 IP，
+# 配合安全组放行 UDP 端口范围即可直连（EIP/1:1 NAT 场景）。
+_PUBLIC_IP = os.environ.get("ZL_PUBLIC_IP", "").strip()
+
+
+def _rewrite_sdp_public_ip(sdp: str) -> str:
+    if not _PUBLIC_IP:
+        return sdp
+    sdp = re.sub(r"(?m)^c=IN IP4 \S+", f"c=IN IP4 {_PUBLIC_IP}", sdp)
+    sdp = re.sub(
+        r"(a=candidate:\S+ \d+ udp \d+ )(\S+)( \d+ typ host)",
+        lambda m: m.group(1) + _PUBLIC_IP + m.group(3),
+        sdp,
+    )
+    return sdp
+
+
+async def _wait_ice_gathering(pc, timeout: float = 3.0) -> None:
+    """等 aiortc 收集完 ICE 候选再返回 answer，避免 SDP 里没有 candidate。"""
+    if pc.iceGatheringState == "complete":
+        return
+    loop = asyncio.get_event_loop()
+    fut = loop.create_future()
+
+    @pc.on("icegatheringstatechange")
+    def _on_state_change():
+        if pc.iceGatheringState == "complete" and not fut.done():
+            fut.set_result(None)
+
+    # 注册回调后立即再查一次，避免状态刚好在注册前变成 complete 导致白等超时
+    if pc.iceGatheringState == "complete" and not fut.done():
+        fut.set_result(None)
+
+    try:
+        await asyncio.wait_for(fut, timeout)
+    except asyncio.TimeoutError:
+        pass
 
 
 # def _rand_session_id(n: int = 6) -> int:
@@ -43,6 +106,10 @@ class RTCManager:
         """
         self.opt = opt
         self.pcs: set = set()
+        # HTTP-FLV 降级通道的推流：sessionid -> {publisher, player, own_session, last_ping}
+        self.flv_publishers: Dict[str, dict] = {}
+        # 并发 publish（多标签页/重试）会各起一路 ffmpeg 抢同一个流名，必须串行化
+        self._flv_publish_lock = asyncio.Lock()
 
     # pc 判定为「仍在尝试连接」的宽限期：超过它还没 connected，就认为是死连接。
     # 依据：ICE 连不上时 aiortc 的 connectionState 会**长期停在 connecting/checking**、
@@ -120,17 +187,54 @@ class RTCManager:
                 text=json.dumps({"code": -1, "msg": "reach max session"}),
             )
 
-        # ── 阶段 1：创建会话（含形象冷加载，可能远超 30s）——独立超时 ──
+        # ── 阶段 1：复用或创建会话（含形象冷加载，可能远超 30s）——独立超时 ──
+        # 页面在 ICE 失败后经常连续重试 offer。每次新建会话会多一套渲染/推理线程，
+        # 旧会话还要保留 5 分钟，越用越卡。这里在单会话场景下优先复用「没有活跃
+        # WebRTC 连接、没有被 WS 租用、且形象相同」的会话。
         session_timeout = getattr(self.opt, 'session_timeout', 120.0)
-        sessionid = await asyncio.wait_for(
-            session_manager.create_session(params),
-            timeout=session_timeout,
-        )
-        webrtc_log.info(
-            "offer received, creating session",
-            extra={"sessionid": sessionid},
-        )
-        avatar_session = session_manager.get_session(sessionid)
+        sessionid = ''
+        params_sid = (params.get('sessionid') or '').strip() if isinstance(params, dict) else ''
+        if (params_sid and session_manager.has_session(params_sid)
+                and not session_manager.is_leased(params_sid)):
+            sessionid = params_sid
+        elif os.environ.get('REUSE_SESSION_ON_OFFER', '0').strip().lower() in ('1', 'true', 'yes', 'on'):
+            want_avatar = params.get('avatar') or getattr(self.opt, 'avatar_id', None)
+            for sid in reversed(list(session_manager.sessions.keys())):
+                if not session_manager.has_session(sid):
+                    continue
+                # WS 降级通道正在进行时绝不能换播放器，否则那条 WS 会收不到帧
+                if session_manager.is_leased(sid):
+                    continue
+                # 只认「真的连上了」的 pc；failed/connecting 的都算可复用
+                if self.session_has_live_pc(sid, require_connected=True):
+                    continue
+                sess = session_manager.get_session(sid)
+                if getattr(getattr(sess, 'opt', None), 'avatar_id', None) != want_avatar:
+                    continue
+                sessionid = sid
+                break
+
+        if sessionid:
+            session_manager.touch(sessionid)
+            try:
+                session_manager.pending_destroy.discard(sessionid)
+            except Exception:
+                pass
+            webrtc_log.info(
+                "offer reused existing session",
+                extra={"sessionid": sessionid},
+            )
+            avatar_session = session_manager.get_session(sessionid)
+        else:
+            sessionid = await asyncio.wait_for(
+                session_manager.create_session(params),
+                timeout=session_timeout,
+            )
+            webrtc_log.info(
+                "offer received, creating session",
+                extra={"sessionid": sessionid},
+            )
+            avatar_session = session_manager.get_session(sessionid)
 
         # 资源快照含 time.sleep(0.5) 的 CPU 采样，放到线程池避免阻塞事件循环
         await asyncio.get_event_loop().run_in_executor(
@@ -192,8 +296,14 @@ class RTCManager:
                     extra={"sessionid": sessionid},
                 )
             else:
-                session_manager.stop_session(sessionid)
-                session_manager.remove_session(sessionid)
+                # 不在这里销毁会话：WS 模式/页面重连会在几秒内复用同一会话，
+                # 立即销毁会导致每次 pc 失败都重新加载形象（实测约 11s）。
+                # 统一交给 app.py 的空闲回收任务（无租约、无活 pc、空闲超 5 分钟）。
+                session_manager.mark_pending_destroy(sessionid)
+                webrtc_log.info(
+                    "pc closed, session kept for reuse (reaper will clean when idle)",
+                    extra={"sessionid": sessionid},
+                )
             webrtc_log.info(
                 "pc cleanup completed",
                 extra={"sessionid": sessionid},
@@ -265,7 +375,20 @@ class RTCManager:
 
         answer = await pc.createAnswer()
         await pc.setLocalDescription(answer)
+        await _wait_ice_gathering(pc, 3.0)
         webrtc_log.info("local description set", extra={"sessionid": sessionid})
+
+        sdp = _rewrite_sdp_public_ip(pc.localDescription.sdp)
+        if "a=candidate:" not in sdp:
+            webrtc_log.warning(
+                "answer SDP has no ICE candidate, browser cannot connect",
+                extra={"sessionid": sessionid},
+            )
+        if _PUBLIC_IP:
+            webrtc_log.info(
+                "rewrote SDP host candidates to public IP %s", _PUBLIC_IP,
+                extra={"sessionid": sessionid},
+            )
 
         await asyncio.get_event_loop().run_in_executor(
             None, log_resource_snapshot, "after_answer", sessionid
@@ -274,7 +397,7 @@ class RTCManager:
         return web.Response(
             content_type="application/json",
             text=json.dumps({
-                "sdp": pc.localDescription.sdp,
+                "sdp": sdp,
                 "type": pc.localDescription.type,
                 "sessionid": sessionid,
             }),
@@ -343,8 +466,144 @@ class RTCManager:
             RTCSessionDescription(sdp=answer_sdp, type='answer')
         )
 
+    # ─── HTTP-FLV 降级通道 ──────────────────────────────────────────────
+    # 按需起一路独立会话，用 ffmpeg 把帧编码成 RTMP 推到本机 SRS，SRS 的
+    # http_remux 再输出 /live/livestream.flv。不走 SRS 的 rtc_to_rtmp：
+    # 那条链路要做异步音频转码，音视频消息偶尔乱序，SRS 的观众端时间戳纠偏
+    # 会把视频时间戳拧来拧去（实测 200~350ms 跳变），播放端一顿一顿。
+    # 详见 server/flv_publisher.py。
+    async def handle_flv_publish(self, push_url: str = "", sessionid: str = None) -> str:
+        async with self._flv_publish_lock:
+            return await self._handle_flv_publish_locked(push_url, sessionid)
+
+    async def _handle_flv_publish_locked(self, push_url: str, sessionid: str) -> str:
+        from server.flv_publisher import FlvPublisher
+        from server.webrtc import HumanPlayer
+
+        # 多标签页/失败重试时复用同一路推流：否则多个 ffmpeg 抢同一个 RTMP 流名，
+        # 失败的一方反复重建会话，表现为“老是掉线”。
+        for sid, entry in list(self.flv_publishers.items()):
+            if entry["publisher"].is_alive():
+                entry["last_ping"] = time.time()
+                session_manager.touch(sid)
+                logger.info("[flv] 复用已有推流 sessionid=%s", sid)
+                return sid
+
+        own_session = False
+        if not (sessionid and session_manager.has_session(sessionid)):
+            sessionid = await session_manager.create_session({})
+            own_session = True
+        avatar_session = session_manager.get_session(sessionid)
+
+        player = HumanPlayer(avatar_session)
+        # 与 WS 通道同理：没有消费者取帧时渲染线程不会自己跑起来
+        player.ensure_worker()
+
+        loop = asyncio.get_running_loop()
+
+        async def _try_start():
+            publisher = FlvPublisher(player, sessionid, push_url)
+            try:
+                await loop.run_in_executor(None, publisher.start)
+            except Exception:
+                await loop.run_in_executor(None, publisher.stop)
+                raise
+            return publisher
+
+        try:
+            publisher = await _try_start()
+        except Exception:
+            # SRS 上同名流刚释放时 RTMP 会短暂报 I/O error，等 1.5s 再试一次
+            await asyncio.sleep(1.5)
+            try:
+                publisher = await _try_start()
+            except Exception:
+                try:
+                    player.release_worker()
+                except Exception:
+                    pass
+                if own_session:
+                    session_manager.stop_session(sessionid)
+                    session_manager.remove_session(sessionid)
+                raise
+
+        self.flv_publishers[sessionid] = {
+            "publisher": publisher,
+            "player": player,
+            "own_session": own_session,
+            "last_ping": time.time(),
+        }
+
+        def _on_ffmpeg_exit():
+            loop.call_soon_threadsafe(
+                lambda: asyncio.ensure_future(self.stop_flv_publish(sessionid))
+            )
+
+        publisher.on_exit = _on_ffmpeg_exit
+
+        session_manager.lease_session(sessionid)
+        session_manager.touch(sessionid)
+        logger.info("[flv] 推流已启动 sessionid=%s url=%s", sessionid, publisher.push_url)
+        return sessionid
+
+    def touch_flv_publish(self, sessionid: str) -> bool:
+        """浏览器心跳：返回 False 表示推流已不存在。"""
+        entry = self.flv_publishers.get(sessionid)
+        if entry is None or not entry["publisher"].is_alive():
+            return False
+        entry["last_ping"] = time.time()
+        session_manager.touch(sessionid)
+        return True
+
+    def flv_status(self, sessionid: str) -> dict:
+        entry = self.flv_publishers.get(sessionid)
+        if entry is None:
+            return {}
+        publisher = entry["publisher"]
+        return {
+            "video_frames": int(publisher.video_frames),
+            "alive": publisher.is_alive(),
+        }
+
+    async def stop_flv_publish(self, sessionid: str) -> bool:
+        entry = self.flv_publishers.pop(sessionid, None)
+        if entry is None:
+            return False
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None, entry["publisher"].stop
+            )
+        except Exception:
+            logger.debug("[flv] publisher.stop failed", exc_info=True)
+        try:
+            entry["player"].release_worker()
+        except Exception:
+            logger.debug("[flv] release_worker failed", exc_info=True)
+        session_manager.release_session(sessionid)
+        if entry.get("own_session"):
+            session_manager.stop_session(sessionid)
+            session_manager.remove_session(sessionid)
+        else:
+            session_manager.touch(sessionid)
+        logger.info("[flv] 推流已停止 sessionid=%s", sessionid)
+        return True
+
+    async def reap_flv_publishers(self, idle_seconds: float = 45.0) -> None:
+        """浏览器异常退出时收掉没人要的推流（页面每 5s 心跳一次）。"""
+        now = time.time()
+        for sid, entry in list(self.flv_publishers.items()):
+            if now - entry.get("last_ping", 0) <= idle_seconds:
+                continue
+            logger.info("[flv] 推流心跳超时，自动停止 sessionid=%s", sid)
+            try:
+                await self.stop_flv_publish(sid)
+            except Exception:
+                logger.exception("[flv] 自动停止失败 sessionid=%s", sid)
+
     async def shutdown(self):
-        """关闭所有 PeerConnection"""
+        """关闭全部 PeerConnection"""
+        for sid in list(self.flv_publishers.keys()):
+            await self.stop_flv_publish(sid)
         coros = [pc.close() for pc in self.pcs]
         await asyncio.gather(*coros)
         self.pcs.clear()

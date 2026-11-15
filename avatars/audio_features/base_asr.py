@@ -63,11 +63,33 @@ class BaseASR:
     def flush_talk(self):
         self.queue.queue.clear()
 
-    def put_audio_frame(self,audio_chunk:NDArray[np.float32],datainfo:dict): #16khz 20ms pcm
-        self.queue.put(AudioFrameData(data=audio_chunk,type=0,userdata=datainfo))
+    def put_audio_frame(self,audio_chunk:NDArray[np.float32],datainfo:dict,
+                        utt_id:str='',chunk_index:int=-1,
+                        data32:NDArray[np.float32]=None): #16khz 20ms pcm
+        self.queue.put(AudioFrameData(data=audio_chunk,type=0,userdata=datainfo,
+                                      data32=data32,
+                                      utt_id=utt_id,chunk_index=chunk_index))
+
+    def _pace_frame(self):
+        """按 20ms/帧的实时节拍限速。
+
+        TTS 音频、静音帧如果被瞬间消费完，整条管线会超前产出，下游播放队列只能丢帧，
+        表现就是待机画面一顿一顿、说话时偶发吞字。这里把消费速度钉在实时。
+        """
+        now = time.monotonic()
+        next_ts = getattr(self, '_next_frame_ts', None)
+        if next_ts is None or next_ts < now - 0.5:
+            next_ts = now
+        wait = next_ts - now
+        if wait > 0:
+            time.sleep(wait)
+        self._next_frame_ts = next_ts + self.chunk / self.sample_rate
+        if self._next_frame_ts < time.monotonic() - 0.1:
+            self._next_frame_ts = time.monotonic()
 
     #return frame:audio pcm; type: 0-normal speak, 1-silence; eventpoint:custom event sync with audio
     def get_audio_frame(self)->AudioFrameData:        
+        self._pace_frame()
         audiotype = self.parent.custom_audiotype if self.parent else 0
         try:
             # 仅当当前动作「配有固定音频」（如思考 think）时优先播放固定音频；

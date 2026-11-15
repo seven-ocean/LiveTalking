@@ -71,6 +71,10 @@ class SessionManager:
             sessionid = _rand_session_id()
 
         logger.info('Creating sessionid=%s, current session num=%d', sessionid, len(self.sessions))
+        # 建会话（尤其加载新形象/新模型）前，若当前没有活动会话，先把空闲缓存还给驱动；
+        # 有活动会话时不动（empty_cache 与另一条推理线程并发在 MACA 上不稳）。
+        if not self.sessions:
+            self.release_gpu_cache()
         # 预先占位防止重复
         self.sessions[sessionid] = None
         self.touch(sessionid)
@@ -114,6 +118,26 @@ class SessionManager:
         self.last_active.pop(sessionid, None)
         self.leases.pop(sessionid, None)
         self.pending_destroy.discard(sessionid)
+        if not self.sessions:
+            self.release_gpu_cache()
+
+    @staticmethod
+    def release_gpu_cache():
+        """会话销毁后把 PyTorch 的 CUDA 缓存还给驱动。
+
+        不调用的话，分配器会跨会话保留大块缓存，反复开关数字人时显存水位只涨不降，
+        最终在下一次推理时 OOM（表现为画面卡死在最后一帧）。
+        """
+        try:
+            import torch
+
+            # 注意：不要在这里 gc.collect()。本进程缓存着多套形象的帧数组（每套 ~1GB），
+            # 全量 GC 会卡住事件循环数秒，表现为“点开/关闭数字人时页面一顿”。
+            # 只把分配器的空闲块还给驱动即可。
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            logger.exception("release_gpu_cache 失败")
 
     # ─── 会话租约（WS 降级通道专用）──────────────────────────────────
     def lease_session(self, sessionid: str):
