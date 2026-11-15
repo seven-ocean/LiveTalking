@@ -68,6 +68,45 @@ WS_SEND_TIMEOUT = 5.0
 BIN_JPEG = 0x01
 BIN_PCM = 0x02
 
+# 每路 WS 的对账统计（供测试页 /ws/stats 查询；只统计，不影响播放逻辑）
+_WS_STATS = {}
+
+
+def snapshot_stats(sessionid, player, video_slot, stats, h264, codec):
+    try:
+        vs = video_slot.stats() if hasattr(video_slot, 'stats') else {}
+        es = h264.stats() if h264 is not None else {}
+        _WS_STATS[sessionid] = {
+            'codec': codec,
+            'ts': time.time(),
+            'produced_video': int(getattr(player, 'produced_video', 0)),
+            'produced_audio': int(getattr(player, 'produced_audio', 0)),
+            'ws_slot': vs,
+            'downsample': int(vs.get('drops', 0)),
+            'feed_pops': int(stats.get('feed_pops', 0)),
+            'feed_none': int(stats.get('feed_none', 0)),
+            'aus_sent': int(stats.get('aus_sent', 0)),
+            'audio_sent': int(stats.get('audio_sent', 0)),
+            'silence_sent': int(stats.get('silence_sent', 0)),
+            'enc': es,
+            'server_dropped': int(
+                stats.get('feed_none', 0)
+                + es.get('feed_dropped', 0)
+                + es.get('async_dropped', 0)
+            ),
+        }
+    except Exception:
+        logger.debug("ws_video: snapshot_stats failed", exc_info=True)
+
+
+async def ws_stats(request: web.Request) -> web.Response:
+    sid = (request.query.get("sessionid") or "").strip()
+    data = _WS_STATS.get(sid)
+    if not data or time.time() - data.get("ts", 0) > 300:
+        _WS_STATS.pop(sid, None)
+        return web.json_response({"code": -1, "msg": "no stats"}, status=404)
+    return web.json_response({"code": 0, "data": data})
+
 # 静态帧跳过：待机时画面几乎不变，没必要每帧都编 JPEG。用缩小图的平均绝对差判断，
 # 成本约 0.1ms（对比 ~8ms 的 JPEG 编码），待机 CPU 能降一大截。
 STATIC_DIFF_THRESHOLD = 1.2
@@ -400,6 +439,7 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
                 while player.ws_video_sent_seq < seq and time.monotonic() < deadline:
                     await asyncio.sleep(0.005)
                 if player.ws_video_sent_seq < seq:
+                    _stats['silence_sent'] += 1
                     await send_bytes(silence)
                     continue
 
@@ -407,6 +447,7 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
             arr = frame.to_ndarray()
             pcm = arr.tobytes() if arr.dtype == np.int16 else arr.astype(np.int16).tobytes()
             await send_bytes(bytes((BIN_PCM,)) + pcm)
+            _stats['audio_sent'] += 1
             pending = None
 
     async def pump_h264_feed() -> None:
@@ -415,6 +456,7 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
         slot = 0
         while not ws.closed:
             item = video_slot.pop()
+            _stats['feed_pops'] += 1
             frame, seq = item if isinstance(item, tuple) else (item, -1)
             target = start + slot * frame_interval
             now = time.monotonic()
@@ -422,6 +464,7 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
                 await asyncio.sleep(target - now)
             slot += 1
             if frame is None:
+                _stats['feed_none'] += 1
                 continue
             h264.push_frame(frame, seq)
             if time.monotonic() - target > 1.0:  # 落后太多：重新对齐
@@ -433,11 +476,20 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
             item = await h264.next_au()
             key, au, seq = item if len(item) == 3 else (item[0], item[1], -1)
             await send_bytes(bytes((BIN_H264, 1 if key else 0)) + au)
+            _stats['aus_sent'] += 1
             # 真正写进 socket 之后才算「视频已发出」，音频门控以此为准
             if seq >= 0 and seq > player.ws_video_sent_seq:
                 player.ws_video_sent_seq = seq
 
     player.ws_active = True
+    _stats = {'feed_pops': 0, 'feed_none': 0, 'aus_sent': 0,
+              'audio_sent': 0, 'silence_sent': 0}
+
+    async def _stats_loop():
+        while not ws.closed:
+            snapshot_stats(sessionid, player, video_slot, _stats, h264,
+                           'h264' if h264 is not None else 'jpeg')
+            await asyncio.sleep(1.0)
     if h264 is not None:
         tasks = [
             asyncio.ensure_future(pump_h264_feed()),
@@ -446,6 +498,7 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
         ]
     else:
         tasks = [asyncio.ensure_future(pump_video()), asyncio.ensure_future(pump_audio())]
+    tasks.append(asyncio.ensure_future(_stats_loop()))
     try:
         async for msg in ws:
             if msg.type == WSMsgType.TEXT:
@@ -490,6 +543,22 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
             session_manager.release_session(sessionid)
             session_manager.touch(sessionid)
             logger.info("ws_video: 会话保留待复用 sessionid=%s", sessionid)
+        snapshot_stats(sessionid, player, video_slot, _stats, h264,
+                       'h264' if h264 is not None else 'jpeg')
+        try:
+            vs = video_slot.stats() if hasattr(video_slot, 'stats') else {}
+            es = h264.stats() if h264 is not None else {}
+            logger.info(
+                "[ws-stats] sessionid=%s produced_video=%d produced_audio=%d "
+                "ws_slot=%s feed_pops=%d feed_none=%d aus_sent=%d "
+                "audio_sent=%d silence_sent=%d enc=%s",
+                sessionid, getattr(player, 'produced_video', -1),
+                getattr(player, 'produced_audio', -1), vs,
+                _stats['feed_pops'], _stats['feed_none'], _stats['aus_sent'],
+                _stats['audio_sent'], _stats['silence_sent'], es,
+            )
+        except Exception:
+            logger.debug("ws_video: stats log failed", exc_info=True)
         logger.info("ws_video: client disconnected, sessionid=%s", sessionid)
 
     return ws

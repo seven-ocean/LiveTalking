@@ -29,6 +29,7 @@ _API_PREFIXES = (
     "/offer",
     "/human",
     "/humanaudio",
+    "/ws/stats",
     "/set_audiotype",
     "/record",
     "/interrupt_talk",

@@ -225,11 +225,16 @@ class _FifoSlot:
         self._buf = collections.deque()
         self._maxsize = maxsize
         self._drop_oldest = drop_oldest
+        self.puts = 0
+        self.drops = 0
+        self.clears = 0
 
     def put(self, item) -> None:
         with self._cv:
+            self.puts += 1
             if len(self._buf) >= self._maxsize:
                 self._buf.popleft()
+                self.drops += 1
             self._buf.append(item)
             self._cv.notify_all()
 
@@ -243,7 +248,13 @@ class _FifoSlot:
         with self._cv:
             n = len(self._buf)
             self._buf.clear()
+            self.clears += 1
             return n
+
+    def stats(self) -> dict:
+        with self._cv:
+            return {'puts': self.puts, 'drops': self.drops,
+                    'clears': self.clears, 'qsize': len(self._buf)}
 
     def qsize(self) -> int:
         with self._cv:
@@ -276,6 +287,8 @@ class HumanPlayer:
         # process_frames 按「1 视频 + 2 音频(40ms)」成对产出；这里给每对分配 seq，
         # 音频只在对应视频已经发出后才允许发送，视频慢时音频跟着停/丢，避免声音越跑越前。
         self.av_seq = 0
+        self.produced_video = 0
+        self.produced_audio = 0
         self._last_video_seq = -1
         self.video_sent_seq = -1          # WebRTC 视频轨已发出的最大 seq
         self.ws_video_sent_seq = -1       # WS 降级通道已发出的最大 seq
@@ -296,6 +309,7 @@ class HumanPlayer:
 
     def push_video(self, frame):
         from av import VideoFrame
+        self.produced_video += 1
         new_frame = VideoFrame.from_ndarray(frame, format="bgr24")
         with self._av_cond:
             seq = self.av_seq
@@ -331,6 +345,7 @@ class HumanPlayer:
 
     def push_audio(self, frame, eventpoint=None):
         from av import AudioFrame
+        self.produced_audio += 1
         new_frame = AudioFrame(format='s16', layout='mono', samples=frame.shape[0])
         new_frame.planes[0].update(frame.tobytes())
         new_frame.sample_rate = SAMPLE_RATE

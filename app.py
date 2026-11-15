@@ -731,8 +731,9 @@ def main():
 
     # ─── WS 音视频降级通道（特殊环境，默认不启用，见 server/ws_video.py）──
     # 必须在 setup_routes(内含 add_static '/') 之前注册，否则会被静态路由吞掉
-    from server.ws_video import ws_video
+    from server.ws_video import ws_video, ws_stats
     appasync.router.add_get("/ws/video", ws_video)
+    appasync.router.add_get("/ws/stats", ws_stats)
     
     # 注册 server/routes.py 中的通用 API 路由
     setup_routes(appasync)

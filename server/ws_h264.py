@@ -115,6 +115,14 @@ class H264Encoder:
         self._au_has_vcl = False
         self._au_key = False
         self.dropped = 0
+        # 对账计数（只统计，不影响逻辑）
+        self.feed_pushed = 0
+        self.feed_dropped = 0
+        self.feeder_writes = 0
+        self.feeder_dups = 0
+        self.feeder_starved = 0
+        self.aus = 0
+        self.async_dropped = 0
 
     # ─── 生命周期 ────────────────────────────────────────────────────
     def start(self, loop) -> None:
@@ -212,9 +220,11 @@ class H264Encoder:
     def push_frame(self, frame, seq: int = -1) -> None:
         """由 WS 事件循环调用（只入队，不阻塞）。"""
         item = (frame, seq)
+        self.feed_pushed += 1
         try:
             self._feed_q.put_nowait(item)
         except queue.Full:
+            self.feed_dropped += 1
             try:
                 self._feed_q.get_nowait()
             except queue.Empty:
@@ -241,6 +251,10 @@ class H264Encoder:
                 last, last_seq = frame, seq
             except queue.Empty:
                 frame, seq = last, last_seq
+                if frame is not None:
+                    self.feeder_dups += 1
+                else:
+                    self.feeder_starved += 1
             if frame is not None:
                 try:
                     bgr = frame.to_ndarray(format="bgr24")
@@ -249,6 +263,7 @@ class H264Encoder:
                             bgr, (self.width, self.height), interpolation=cv2.INTER_AREA
                         )
                     self._proc.stdin.write(bgr.tobytes())
+                    self.feeder_writes += 1
                     with self._inflight_lock:
                         self._inflight.append(seq)
                 except (BrokenPipeError, ValueError, OSError):
@@ -352,6 +367,7 @@ class H264Encoder:
         with self._inflight_lock:
             seq = self._inflight.popleft() if self._inflight else -1
         avcc = b"".join(len(n).to_bytes(4, "big") + n for n in kept)
+        self.aus += 1
         self._deliver(key, avcc, seq)
 
     def _deliver(self, key: bool, avcc: bytes, seq: int = -1) -> None:
@@ -368,6 +384,7 @@ class H264Encoder:
                 except Exception:
                     pass
                 self.dropped += 1
+                self.async_dropped += 1
                 if self.dropped % 25 == 0:
                     logger.warning("[ws-h264] 发送队列积压，已丢弃 %d 帧", self.dropped)
             q.put_nowait((key, avcc, seq))
@@ -376,6 +393,17 @@ class H264Encoder:
             self._loop.call_soon_threadsafe(_put)
         except Exception:
             pass
+
+    def stats(self) -> dict:
+        return {
+            'feed_pushed': self.feed_pushed,
+            'feed_dropped': self.feed_dropped,
+            'feeder_writes': self.feeder_writes,
+            'feeder_dups': self.feeder_dups,
+            'feeder_starved': self.feeder_starved,
+            'aus': self.aus,
+            'async_dropped': self.async_dropped,
+        }
 
     # ─── 给 WS 协程使用 ─────────────────────────────────────────────
     async def next_au(self):
