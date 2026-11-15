@@ -77,6 +77,81 @@ def get_gpu_memory():
         return None
 
 
+# ─── cgroup 口径的 CPU（容器配额，而不是宿主机 128 核）────────────────────
+_CG_PREV = {'usage': None, 'thr': None, 'ts': None}
+
+
+def _read_int(path):
+    try:
+        with open(path, 'r') as f:
+            return int(f.read().strip())
+    except Exception:
+        return None
+
+
+def get_cgroup_cpu():
+    """返回容器 CPU 配额/使用率/节流增量。
+
+    日志里原来的 CPU 百分比来自 /proc/stat（宿主机 128 核），会被严重低估；
+    容器实际受 cgroup 配额限制，必须按配额算，并观察 nr_throttled/throttled_time。
+    """
+    quota = period = None
+    try:
+        parts = open('/sys/fs/cgroup/cpu.max').read().split()
+        if parts and parts[0] != 'max':
+            quota, period = int(parts[0]), int(parts[1])
+    except Exception:
+        pass
+    if quota is None:
+        q = _read_int('/sys/fs/cgroup/cpu/cpu.cfs_quota_us')
+        p = _read_int('/sys/fs/cgroup/cpu/cpu.cfs_period_us')
+        if q and p and q > 0:
+            quota, period = q, p
+    usage = _read_int('/sys/fs/cgroup/cpu/cpuacct.usage')
+    if usage is None:
+        usage = _read_int('/sys/fs/cgroup/cpu,cpuacct/cpuacct.usage')
+
+    stat = {}
+    for f in ('/sys/fs/cgroup/cpu/cpu.stat', '/sys/fs/cgroup/cpu.stat'):
+        try:
+            with open(f, 'r') as fh:
+                for line in fh:
+                    k, v = line.split()
+                    stat[k] = int(v)
+            break
+        except Exception:
+            pass
+
+    now = time.time()
+    res = {
+        'quota_cores': round(quota / period, 2) if quota and period else None,
+        'nr_throttled': stat.get('nr_throttled'),
+    }
+    prev = _CG_PREV
+    if prev['usage'] is not None and usage is not None and prev['ts']:
+        dt = max(1e-3, now - prev['ts'])
+        cores = (usage - prev['usage']) / 1e9 / dt
+        res['cores_used'] = round(cores, 2)
+        if res['quota_cores']:
+            res['usage_pct_of_quota'] = round(cores / res['quota_cores'] * 100, 1)
+    if prev['thr'] is not None and 'throttled_time' in stat:
+        res['throttled_ms'] = round((stat['throttled_time'] - prev['thr']) / 1e6, 1)
+    _CG_PREV.update(usage=usage, thr=stat.get('throttled_time'), ts=now)
+    return res
+
+
+def _mx_smi_util():
+    """沐曦（MACA）GPU 利用率：mx-smi --show-usage。"""
+    try:
+        import re
+        import subprocess
+        r = subprocess.run(['mx-smi', '--show-usage'], capture_output=True, text=True, timeout=5)
+        m = re.search(r'GPU\s*:\s*(\d+)\s*%', r.stdout or '')
+        return {'gpu_util_pct': int(m.group(1))} if m else None
+    except Exception:
+        return None
+
+
 def _check_nvidia_smi():
     """检查 nvidia-smi 是否可用"""
     if not torch.cuda.is_available():
@@ -91,7 +166,13 @@ def _check_nvidia_smi():
 
 
 def get_gpu_utilization():
-    """获取 GPU 利用率 (仅 NVIDIA GPU 有效)"""
+    """获取 GPU 利用率：沐曦用 mx-smi，NVIDIA 用 nvidia-smi。"""
+    try:
+        name = torch.cuda.get_device_name(0).lower() if torch.cuda.is_available() else ''
+    except Exception:
+        name = ''
+    if 'metax' in name or 'maca' in name:
+        return _mx_smi_util()
     if not _check_nvidia_smi():
         return None
     try:
@@ -202,7 +283,7 @@ def log_device_info():
 
 
 def log_resource_usage():
-    """打印一次当前资源占用"""
+    """打印一次当前资源占用（CPU 按容器配额口径，GPU 按实际切片容量）"""
     gpu_mem = get_gpu_memory()
     if gpu_mem:
         gpu_util = get_gpu_utilization()
@@ -213,12 +294,20 @@ def log_resource_usage():
         )
 
     ram = get_memory()
+    cg = get_cgroup_cpu()
+    cpu_str = ''
+    if cg.get('quota_cores'):
+        if 'cores_used' in cg:
+            cpu_str = (f"CPU {cg['cores_used']:.2f}/{cg['quota_cores']:.1f} 核 "
+                       f"({cg.get('usage_pct_of_quota', 0):.1f}% 配额)")
+        else:
+            cpu_str = f"CPU 配额 {cg['quota_cores']:.1f} 核"
+        if 'throttled_ms' in cg:
+            cpu_str += f"，节流 +{cg['throttled_ms']:.0f}ms"
     if ram:
-        cpu = get_cpu_load()
-        cpu_str = f", CPU: {cpu.get('cpu_usage_pct', '?')}%" if cpu and 'cpu_usage_pct' in cpu else ""
         logger.info(
             f"[资源] RAM {ram['used_mb']:.0f}/{ram['total_mb']:.0f} MB "
-            f"({ram['used_pct']}%){cpu_str}"
+            f"({ram['used_pct']}%)" + (f"，{cpu_str}" if cpu_str else "")
         )
 
 
