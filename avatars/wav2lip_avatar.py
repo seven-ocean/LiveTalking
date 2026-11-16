@@ -121,7 +121,8 @@ class ONNXWav2LipWrapper:
         )
         
         # 将输出转换回 torch.Tensor
-        return torch.from_numpy(outputs[0]).to(device)
+        # 输出保持 CPU：调用方马上会 pred.cpu().numpy()，再拷回 GPU 纯属浪费。
+        return torch.from_numpy(outputs[0])
     
     def eval(self):
         """兼容接口，ONNX 模型不需要 eval 模式"""
@@ -223,8 +224,13 @@ class LipReal(BaseAvatar):
         img_batch = np.concatenate((img_masked, img_batch), axis=3) / 255.
         audiofeat_batch = np.reshape(audiofeat_batch, [len(audiofeat_batch), audiofeat_batch.shape[1], audiofeat_batch.shape[2], 1])
         
-        img_batch = torch.FloatTensor(np.transpose(img_batch, (0, 3, 1, 2))).to(device)
-        audiofeat_batch = torch.FloatTensor(np.transpose(audiofeat_batch, (0, 3, 1, 2))).to(device)
+        img_batch = torch.FloatTensor(np.transpose(img_batch, (0, 3, 1, 2)))
+        audiofeat_batch = torch.FloatTensor(np.transpose(audiofeat_batch, (0, 3, 1, 2)))
+        # ONNX/MACA provider 需要 CPU numpy 输入；先 .to(device) 再在包装层拷回 CPU
+        # 会多两次显存拷贝和同步，实测会把说话帧率从可用水平拖到 10fps 左右。
+        if not isinstance(self.model, ONNXWav2LipWrapper):
+            img_batch = img_batch.to(device)
+            audiofeat_batch = audiofeat_batch.to(device)
 
         with torch.no_grad():
             pred = self.model(audiofeat_batch, img_batch)
