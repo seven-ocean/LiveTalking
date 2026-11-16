@@ -356,6 +356,10 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
         dropped = 0
         skipped = 0
         while not ws.closed:
+            if paused[0]:
+                video_slot.clear()
+                await asyncio.sleep(frame_interval)
+                continue
             item = video_slot.pop()
             frame, seq = item if isinstance(item, tuple) else (item, -1)
             now = time.monotonic()
@@ -414,6 +418,11 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
         pending = None  # 已取出、但对应视频还没发出去的那段音频
         silence = bytes((BIN_PCM,)) + b"\x00" * 320 * 2
         while not ws.closed:
+            if paused[0]:
+                pending = None
+                audio_slot.clear()
+                await asyncio.sleep(ptime)
+                continue
             if pending is None:
                 item = audio_slot.pop()
                 if item is not None:
@@ -455,6 +464,12 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
         start = time.monotonic()
         slot = 0
         while not ws.closed:
+            if paused[0]:
+                video_slot.clear()
+                start = time.monotonic()
+                slot = 0
+                await asyncio.sleep(frame_interval)
+                continue
             item = video_slot.pop()
             _stats['feed_pops'] += 1
             frame, seq = item if isinstance(item, tuple) else (item, -1)
@@ -474,6 +489,9 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
     async def send_h264() -> None:
         while not ws.closed:
             item = await h264.next_au()
+            if paused[0]:
+                # 隐藏期间消费掉编码器输出但不发送，防止 ffmpeg 管道积压
+                continue
             key, au, seq = item if len(item) == 3 else (item[0], item[1], -1)
             await send_bytes(bytes((BIN_H264, 1 if key else 0)) + au)
             _stats['aus_sent'] += 1
@@ -482,6 +500,9 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
                 player.ws_video_sent_seq = seq
 
     player.ws_active = True
+    # 客户端隐藏标签页时发 pause：暂停该路视频/音频发送，避免隐藏页在后台
+    # 持续解码/绘制，也避免 socket 积压（多开时把资源让给可见的那一路）。
+    paused = [False]
     _stats = {'feed_pops': 0, 'feed_none': 0, 'aus_sent': 0,
               'audio_sent': 0, 'silence_sent': 0}
 
@@ -508,6 +529,18 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
                     continue
                 if isinstance(data, dict) and data.get("type") == "stop":
                     break
+                if isinstance(data, dict) and data.get("type") == "pause":
+                    paused[0] = True
+                    video_slot.clear()
+                    audio_slot.clear()
+                    logger.info("ws_video: paused by client sessionid=%s", sessionid)
+                    continue
+                if isinstance(data, dict) and data.get("type") == "resume":
+                    paused[0] = False
+                    video_slot.clear()
+                    audio_slot.clear()
+                    logger.info("ws_video: resumed by client sessionid=%s", sessionid)
+                    continue
             elif msg.type in (WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR):
                 break
     except asyncio.CancelledError:
