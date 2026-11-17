@@ -92,22 +92,6 @@ class TaskManager:
             skip_base = bool(task.params.get('skip_base', False))
             base_exists = os.path.isdir(os.path.join(save_path, task.avatar_id, 'full_imgs'))
 
-            if task.model_type == "musetalk":
-                from avatars.musetalk.genavatar import generate_avatar
-                if skip_base and base_exists:
-                    logger.info(f"Task {task_id}: skip_base 且基座已存在，跳过基座生成（编辑模式）")
-                    task.progress = 20
-                else:
-                    generate_avatar(
-                        video_path=task.params['video_path'],
-                        avatar_id=task.avatar_id,
-                        save_path=save_path,
-                        bbox_shift=task.params.get('bbox_shift', 0),
-                        extra_margin=task.params.get('extra_margin', 10),
-                        parsing_mode=task.params.get('parsing_mode', 'jaw'),
-                        version=task.params.get('version', 'v15'),
-                        progress_callback=progress_callback
-                    )
             # ── 单目录方案：基座推理源来源判定 ──
             # 讲解(reply)片段存在时，基座推理源（full_imgs/face_imgs/coords）直接由讲解片段生成，
             # 不再生成 {avatar_id}_reply 子形象，保证「一个形象 = 一个目录」；

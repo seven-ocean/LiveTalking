@@ -67,7 +67,7 @@ import copy
 import gc
 from dotenv import load_dotenv
 
-from utils.hardware_monitor import log_device_info, log_resource_usage, start_monitoring
+from utils.hardware_monitor import log_device_info, log_resource_usage, start_monitoring, get_gpu_memory
 
 
 app = Flask(__name__)
@@ -107,7 +107,19 @@ _avatar_last_used: Dict[str, float] = {}
 _PROCESS_SWITCH = os.getenv("ZL_PROCESS_SWITCH", "0") == "1"
 _DEFER_MODEL_LOAD = os.getenv("ZL_DEFER_MODEL_LOAD", "0") == "1"
 _SWITCH_TARGET_FILE = os.getenv("ZL_SWITCH_TARGET_FILE", "")
-        
+
+# ─── 动态模型切换（auto）─────────────────────────────────────────
+# keep：始终进程内共存；restart/release：换模型就重启；
+# auto：显存充足时 keep，free < max(TALK_GPU_RESERVE_MB, total*TALK_GPU_RESERVE_PCT)
+#       且需要加载另一个模型时，写目标 avatar 后 rc=42 让 wrapper 重启，避免 OOM。
+_MODEL_SWITCH_MODE = (os.getenv("TALK_MODEL_SWITCH_MODE", "auto") or "auto").strip().lower()
+_TALK_GPU_RESERVE_MB = float(os.getenv("TALK_GPU_RESERVE_MB", "0") or 0)
+_TALK_GPU_RESERVE_PCT = float(os.getenv("TALK_GPU_RESERVE_PCT", "0.15") or 0.15)
+logger.info(
+    "[auto-switch] mode=%s reserve_mb=%.0f reserve_pct=%.2f",
+    _MODEL_SWITCH_MODE, _TALK_GPU_RESERVE_MB, _TALK_GPU_RESERVE_PCT,
+)
+
 
 #####webrtc###############################
 # rtc_manager replaces the old pcs set and duplicate offer handlers.
@@ -177,11 +189,65 @@ def _load_model_weights(model_name: str, avatar_mod, opt):
     # ultralight
     return avatar_mod.load_model(opt)
 
-def _needs_model_switch(avatar_id: str) -> bool:
-    if not _PROCESS_SWITCH:
+def _gpu_free_total_mb():
+    """返回 (free_mb, total_mb)；读不到时返回 (None, None)。"""
+    try:
+        mem = get_gpu_memory()
+        if mem:
+            return float(mem.get("free_mb") or 0), float(mem.get("total_mb") or 0)
+    except Exception:
+        logger.debug("读取 GPU 显存失败", exc_info=True)
+    return None, None
+
+
+def _gpu_reserve_mb(total_mb: float) -> float:
+    return max(_TALK_GPU_RESERVE_MB, total_mb * _TALK_GPU_RESERVE_PCT)
+
+
+def _gpu_low_for_model_load() -> bool:
+    """当前显存是否低于安全余量；读不到显存时保守返回 False（不额外重启）。"""
+    free_mb, total_mb = _gpu_free_total_mb()
+    if free_mb is None or total_mb <= 0:
         return False
+    reserve = _gpu_reserve_mb(total_mb)
+    low = free_mb < reserve
+    logger.info(
+        "[auto-switch] GPU free=%.0fMB total=%.0fMB reserve=%.0fMB low=%s",
+        free_mb, total_mb, reserve, low,
+    )
+    return low
+
+
+def _needs_model_switch(avatar_id: str) -> bool:
+    """是否需要进程级切换模型。
+
+    - restart/release：换模型就退出重启（原低配机逻辑）。
+    - auto：显存充足 keep；free 低于安全余量且要加载另一个模型时，
+      写目标 avatar 后 rc=42 重启，避免把 SoVITS/ASR 挤到 OOM。
+    - keep：不切换，进程内共存。
+    """
     model_name = resolve_avatar_model(avatar_id)
-    return bool(_model_runtimes) and model_name not in _model_runtimes
+    if not _model_runtimes:
+        # 进程刚启动、还没有加载任何模型：先加载，不做切换。
+        return False
+    if model_name in _model_runtimes:
+        # 同一个模型，权重共享，不需要重启。
+        return False
+    if _PROCESS_SWITCH or _MODEL_SWITCH_MODE in ("restart", "release"):
+        return True
+    if _MODEL_SWITCH_MODE == "auto":
+        if _gpu_low_for_model_load():
+            logger.info(
+                "[auto-switch] 显存不足，模型切换走进程重启: loaded=%s target=%s",
+                list(_model_runtimes.keys()), model_name,
+            )
+            return True
+        logger.info(
+            "[auto-switch] 显存充足，keep 模式加载新模型: %s", model_name,
+        )
+        return False
+    return False
+
 
 
 def _write_switch_target(avatar_id: str) -> None:
@@ -295,6 +361,11 @@ def get_or_load_avatar(avatar_id: str):
         if cached is not None:
             _avatar_last_used[avatar_id] = time.time()
             return cached
+        # 并发加载不同模型时，第一个模型可能刚加载完；拿到锁后再判断一次，
+        # 避免 keep 模式下同时加载两套模型把显存顶爆。
+        if _needs_model_switch(avatar_id):
+            _write_switch_target(avatar_id)
+            os._exit(42)
         started = time.time()
         model_name = resolve_avatar_model(avatar_id)
         _update_avatar_state(avatar_id, status="loading", startedAt=started,

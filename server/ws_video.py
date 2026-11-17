@@ -255,8 +255,10 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
     fps = WS_FPS or int(getattr(request.app.get("opt"), "fps", None) or DEFAULT_FPS)
     frame_interval = 1.0 / max(1, fps)
     if VIDEO_SCALE and abs(VIDEO_SCALE - 1.0) > 0.01:
-        fw = max(2, int(round(fw * VIDEO_SCALE)))
-        fh = max(2, int(round(fh * VIDEO_SCALE)))
+        # libx264 + yuv420p 要求宽高为偶数；四舍五入可能得到 675 这类奇数，
+        # 会让 H.264 启动失败并回落到 JPEG（前端因此表现为降级通道连接不稳定）。
+        fw = max(2, int(round(fw * VIDEO_SCALE / 2.0)) * 2)
+        fh = max(2, int(round(fh * VIDEO_SCALE / 2.0)) * 2)
 
     # 帧本来就是从 BGR ndarray 建的（HumanPlayer.push_video），to_ndarray 是零拷贝视图；
     # 缩放用 cv2.resize（0.3ms），比 libswscale 的 reformat（约 4ms）快一个数量级。
@@ -293,15 +295,25 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
         try:
             loop = asyncio.get_running_loop()
             h264 = H264Encoder(int(fw), int(fh), fps=fps, bitrate=VIDEO_BITRATE)
+            h264_ready = False
+
+            def _on_h264_exit():
+                # 启动阶段 ffmpeg 若因参数错误立即退出，不能顺手关掉 WS：
+                # 否则后面回落的 JPEG 通道也会被断掉，前端表现为“连接失败/反复重连”。
+                if not h264_ready:
+                    return
+                loop.call_soon_threadsafe(
+                    lambda: asyncio.ensure_future(ws.close())
+                )
+
+            h264.on_exit = _on_h264_exit
             h264.start(loop)
-            h264.on_exit = lambda: loop.call_soon_threadsafe(
-                lambda: asyncio.ensure_future(ws.close())
-            )
             if first_frame is not None:
                 h264.push_frame(first_frame)
             ok = await loop.run_in_executor(None, h264.wait_ready, 5.0)
             if not ok:
                 raise RuntimeError("H.264 编码器 5s 内未输出 SPS/PPS")
+            h264_ready = True
         except Exception:
             logger.exception("ws_video: H.264 启动失败，回落 JPEG")
             if h264 is not None:

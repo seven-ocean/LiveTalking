@@ -1,5 +1,9 @@
 import sys
-from face_detection import FaceAlignment,LandmarksType
+# face-detection 0.2.x 不再导出 FaceAlignment/LandmarksType，改从 face_alignment 顶层取
+try:
+    from face_detection import FaceAlignment, LandmarksType
+except ImportError:
+    from face_alignment import FaceAlignment, LandmarksType
 from os import listdir, path
 import subprocess
 import numpy as np
@@ -13,7 +17,7 @@ from tqdm import tqdm
 
 # initialize the face detection model
 device = "cuda" if torch.cuda.is_available() else "cpu"
-fa = FaceAlignment(LandmarksType._2D, flip_input=False,device=device)
+fa = FaceAlignment(getattr(LandmarksType, "_2D", LandmarksType.TWO_D), flip_input=False,device=device)
 
 # 68 点关键点：用已安装的 face_alignment(FAN) 替代缺失的 face_recognition/dlib
 fa_landmark = face_alignment.FaceAlignment(
@@ -98,15 +102,23 @@ def get_landmark_and_bbox(img_list,upperbondrange =0):
         # face_land_mark= keypoints[0][23:91]
         # face_land_mark = face_land_mark.astype(np.int32)
         img_rgb = cv2.cvtColor(np.asarray(fb)[0], cv2.COLOR_BGR2RGB)
-        landmarks_list = fa_landmark.get_landmarks_from_image(img_rgb)
+        res = fa_landmark.get_landmarks_from_image(img_rgb, return_bboxes=True)
+        landmarks_list, _, detected_faces = res if isinstance(res, tuple) else (res, None, None)
         if landmarks_list:
             # face_alignment(FAN) 输出 68 点，索引与 dlib/iBUG 一致
             face_land_mark = np.asarray(landmarks_list[0]).astype(np.int32)
         else:
             face_land_mark = np.zeros((68, 2), dtype=np.int32)
-        
-        # get bounding boxes by face detetion
-        bbox = fa.get_detections_for_batch(np.asarray(fb))
+
+        # 人脸框：优先用检测结果，检测缺失时退回关键点外接框（仅作为 fallback 使用）
+        if detected_faces:
+            bbox = [tuple(int(v) for v in np.asarray(detected_faces[0][:4]).ravel())]
+        elif landmarks_list:
+            pts = face_land_mark
+            bbox = [(int(pts[:, 0].min()), int(pts[:, 1].min()),
+                     int(pts[:, 0].max()), int(pts[:, 1].max()))]
+        else:
+            bbox = [None]
         
         # adjust the bounding box refer to landmark
         # Add the bounding box to a tuple and append it to the coordinates list

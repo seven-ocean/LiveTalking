@@ -13,8 +13,10 @@ shift
 TARGET="${ZL_SWITCH_TARGET_FILE:-$DIR/../runtime/run/zl-talking.target}"
 AVATAR="${TALK_AVATAR_ID:-wav2lip256_avatar6}"
 # keep：不释放、不重启，两个模型在同一进程内共存（客户高配机默认）
-# restart：切换时退出旧进程、重启新模型，释放 GPU/CUDA 资源（低配机）
-MODE="${TALK_MODEL_SWITCH_MODE:-keep}"
+# restart/release：切换时退出旧进程、重启新模型，释放 GPU/CUDA 资源（低配机）
+# auto：显存充足时 keep；显存不足且要换模型时，app 写目标后 rc=42，
+#       由本 wrapper 重启新进程（避免把 SoVITS/ASR 挤到 OOM）
+MODE="${TALK_MODEL_SWITCH_MODE:-auto}"
 case "$MODE" in
   restart|release) PROCESS_SWITCH=1 ;;
   *) PROCESS_SWITCH=0 ;;
