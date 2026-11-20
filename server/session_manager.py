@@ -32,10 +32,14 @@ class SessionManager:
             self.build_session_fn = None
             # 会话租约（WS 降级通道用）：被租用的会话在 WebRTC pc 关闭时不销毁
             self.leases: Dict[str, int] = {}
+            # 租约最近一次获取时间：用于清理“客户端异常断开、finally 没跑到”的租约泄漏
+            self.lease_at: Dict[str, float] = {}
             # pc 关闭时发现有租约 → 记下“待销毁”，等租约全部释放后再补做
             self.pending_destroy: set = set()
             # 最近活跃时间（按会话）：供空闲回收兜底（见 app.py 的会话回收任务）
             self.last_active: Dict[str, float] = {}
+            # 会话创建时间：容量满时按“最旧”释放，与 last_active 分开记录
+            self.created_at: Dict[str, float] = {}
             self.initialized = True
 
     def touch(self, sessionid: str) -> None:
@@ -77,6 +81,7 @@ class SessionManager:
             self.release_gpu_cache()
         # 预先占位防止重复
         self.sessions[sessionid] = None
+        self.created_at[sessionid] = time.time()
         self.touch(sessionid)
 
         try:
@@ -97,6 +102,63 @@ class SessionManager:
     def add_session(self, sessionid: str, avatar_session: BaseAvatar):
         """同步添加静态或外部管理的会话（供非服务端入口调用）"""
         self.sessions[sessionid] = avatar_session
+        self.created_at.setdefault(sessionid, time.time())
+
+    def active_count(self) -> int:
+        """当前真正建成的会话数（不含建会话中的 None 占位）。"""
+        return sum(1 for s in self.sessions.values() if s is not None)
+
+    def oldest_session(self, exclude=None, predicate=None) -> Optional[str]:
+        """按最后活跃时间取最旧的会话；exclude 可为 id 或 id 集合。
+
+        predicate 用于排除“不能动”的会话（例如还有活 PC / 被 WS 租用）。
+        """
+        if exclude is None:
+            exclude = set()
+        elif isinstance(exclude, str):
+            exclude = {exclude}
+        candidates = []
+        for sid, sess in list(self.sessions.items()):
+            if sess is None or sid in exclude:
+                continue
+            if predicate is not None and not predicate(sid):
+                continue
+            seen = self.last_active.get(sid) or self.created_at.get(sid) or 0.0
+            candidates.append((seen, sid))
+        if not candidates:
+            return None
+        candidates.sort()
+        return candidates[0][1]
+
+    def evict_oldest(self, exclude=None, predicate=None) -> Optional[str]:
+        """按容量策略释放最旧会话，返回被释放的 sessionid。"""
+        sid = self.oldest_session(exclude=exclude, predicate=predicate)
+        if not sid:
+            return None
+        logger.info(
+            "按容量策略释放最旧会话 sessionid=%s（idle=%.1fs）",
+            sid, self.idle_seconds(sid),
+        )
+        self.stop_session(sid)
+        self.remove_session(sid)
+        return sid
+
+    def stats(self):
+        """会话快照（/capacity、/metrics 使用）。"""
+        now = time.time()
+        out = []
+        for sid, sess in list(self.sessions.items()):
+            if sess is None:
+                continue
+            out.append({
+                "sessionid": sid,
+                "avatar": getattr(getattr(sess, "opt", None), "avatar_id", None),
+                "created": self.created_at.get(sid),
+                "idle": self.idle_seconds(sid),
+                "leased": self.is_leased(sid),
+                "lease_age": self.lease_age(sid),
+            })
+        return out
         
     def stop_session(self, sessionid: str):
         """显式停止会话资源，但不删除引用"""
@@ -116,6 +178,7 @@ class SessionManager:
             logger.info(f"Removing session {sessionid}")
             self.sessions.pop(sessionid, None)
         self.last_active.pop(sessionid, None)
+        self.created_at.pop(sessionid, None)
         self.leases.pop(sessionid, None)
         self.pending_destroy.discard(sessionid)
         if not self.sessions:
@@ -143,6 +206,16 @@ class SessionManager:
     def lease_session(self, sessionid: str):
         """标记会话被外部（WS 降级通道）占用，期间 WebRTC pc 关闭不销毁该会话。"""
         self.leases[sessionid] = self.leases.get(sessionid, 0) + 1
+        self.lease_at[sessionid] = time.time()
+
+    def lease_age(self, sessionid: str) -> float:
+        ts = self.lease_at.get(sessionid)
+        return time.time() - ts if ts else float('inf')
+
+    def force_release(self, sessionid: str):
+        """强制清掉租约（用于 finally 没跑到的泄漏场景）。"""
+        self.leases.pop(sessionid, None)
+        self.lease_at.pop(sessionid, None)
 
     def is_leased(self, sessionid: str) -> bool:
         return self.leases.get(sessionid, 0) > 0
@@ -158,6 +231,7 @@ class SessionManager:
             self.leases[sessionid] = cnt - 1
             return False
         self.leases.pop(sessionid, None)
+        self.lease_at.pop(sessionid, None)
         if sessionid in self.pending_destroy:
             self.pending_destroy.discard(sessionid)
             return True

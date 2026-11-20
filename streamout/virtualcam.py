@@ -30,7 +30,7 @@ class VirtualCamOutput(BaseOutput):
         import pyaudio
         p = pyaudio.PyAudio()
         stream = p.open(
-            rate=32000,
+            rate=44100,
             channels=1,
             format=8,
             output=True,
@@ -78,7 +78,7 @@ class VirtualCamOutput(BaseOutput):
             self._cam.send(frame)
             self._cam.sleep_until_next_frame()
 
-    def push_audio_frame(self, frame, eventpoint=None) -> None:
+    def push_audio_frame(self, frame, eventpoint=None, sample_rate=None) -> None:
         if self._audio_queue:
             self._audio_queue.put(frame.tobytes())
             self.parent.notify(eventpoint)

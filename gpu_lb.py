@@ -62,7 +62,7 @@ _HOP_BY_HOP = {
 
 # 单次业务转发总超时（worker 侧 /offer 自带 offer_timeout 兜底，此处只需给足余量）
 _CLIENT_TIMEOUT = aiohttp.ClientTimeout(total=180, connect=5)
-_HEALTH_TIMEOUT = aiohttp.ClientTimeout(total=4)
+_HEALTH_TIMEOUT = aiohttp.ClientTimeout(total=10)
 
 # multipart/form-data 中提取 name="sessionid" 文本字段（仅 /humanaudio 路由用）
 _FORM_SID_RE = re.compile(rb'name="sessionid"\s*\r?\n\s*\r?\n\s*([^\r\n]+)')
@@ -340,13 +340,22 @@ async def _health_loop():
                         data = await resp.json()
                         w.sessions = int(data.get('data', {}).get('sessions', 0))
                         w.ready = True
+                        w.health_fails = 0
                         ok = True
             except Exception:
                 pass
             if ok:
                 continue
-            # 不健康/进程退出 → 作废映射并重启
+            # 首次失败先不杀进程：首个会话加载模型/推理时 /health 可能短暂超时，
+            # 立刻重启会把正在建联的用户踢掉（现场 502/Server disconnected 的主因）。
+            w.health_fails = getattr(w, 'health_fails', 0) + 1
+            if w.health_fails < 2 and w.alive:
+                logger.warning('LB: worker gpu %s (port %d) 健康检查超时（第 %d 次），继续观察',
+                               w.gpu_id, w.port, w.health_fails)
+                continue
+            # 进程已退出或连续失败 → 作废映射并重启
             w.ready = False
+            w.health_fails = 0
             w.sessions = 0
             _drop_routes_of(w)
             logger.warning('LB: worker gpu %s (port %d) 健康检查失败，自动重启',
@@ -359,21 +368,114 @@ async def _health_loop():
 
 # ─── 网关路由分派 ──────────────────────────────────────────────────────────
 
-async def _handle_offer(request):
-    """/offer：选卡 → 转发 → 解析 sessionid 建映射 → 原样返回响应。"""
-    opt = state.opt
+async def _try_evict_idle(opt, aggressive: bool = False):
+    """满员时让 worker 回收一个会话，成功则乐观减一，返回可用下标。
+
+    aggressive=True 时带 `oldest=1`：没有真正空闲的会话，就按 LRU 释放最旧会话，
+    保证已经在排队的新用户能连入。
+    """
+    idle = os.environ.get("TALK_EVICT_IDLE_SECONDS", "10")
+    query = "/evict_idle?idle=%s%s" % (idle, "&oldest=1" if aggressive else "")
+    for w in state.workers:
+        if not w.ready:
+            continue
+        try:
+            async with state.client.post(
+                _base_url(w) + query, timeout=5
+            ) as resp:
+                if resp.status != 200:
+                    continue
+                data = await resp.json()
+                if data.get("code") == 0:
+                    w.sessions = max(0, w.sessions - 1)
+                    logger.info("LB: 满员，已回收%s会话 %s (gpu %s)，会话数=%d",
+                                "最旧" if aggressive else "空闲",
+                                data.get("evicted"), w.gpu_id, w.sessions)
+                    idx, state.rr = pick_worker(state.workers, opt.gpu_ids_strategy,
+                                                state.rr, opt.lb_max_session_per_gpu)
+                    return idx
+        except Exception as e:
+            logger.warning("LB: evict_idle 失败 gpu %s: %s", w.gpu_id, e)
+    return None  # [fix-publish-webrtc]:7f8bbbf120
+
+
+def _queue_response(msg):
+    """排队/启动中的统一响应：503 + queue=true，前端会自动重试并显示中文提示。"""
+    return web.Response(
+        status=503,
+        content_type='application/json',
+        text=json.dumps({'code': 503, 'msg': msg, 'queue': True}, ensure_ascii=False),
+    )
+
+
+async def _pick_offer_worker(opt):
+    """选一个可用 worker 并预占名额；没有可用返回 None。"""
     async with state.lock:
         idx, state.rr = pick_worker(state.workers, opt.gpu_ids_strategy,
                                     state.rr, opt.lb_max_session_per_gpu)
         if idx is None:
-            logger.warning('LB: 所有 worker 均已满员（每卡上限 %d），拒绝新会话',
-                           opt.lb_max_session_per_gpu)
-            return _json_err('all gpu workers reach max sessions (%d per gpu), try later'
-                             % opt.lb_max_session_per_gpu)
+            # [fix-publish-webrtc]:4e6ca365c5 满员时先回收一个会话，别让新用户干等
+            idx = await _try_evict_idle(opt, aggressive=True)
+        if idx is None:
+            return None
         w = state.workers[idx]
         w.reserved += 1  # 预占名额，防止并发 /offer 超卖
+        return w
+
+
+async def _wait_pick_offer_worker(opt):
+    """没有 ready 的 worker 时排队等待（启动/重启窗口），最多 LB_READY_WAIT_SECONDS。"""
     try:
-        resp = await _forward(w, request)
+        wait_s = float(os.environ.get('LB_READY_WAIT_SECONDS', '20') or 20)
+    except (TypeError, ValueError):
+        wait_s = 20.0
+    deadline = time.monotonic() + max(1.0, wait_s)
+    while True:
+        w = await _pick_offer_worker(opt)
+        if w is not None:
+            return w
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(0.5)
+
+
+async def _handle_offer(request):
+    """/offer：选卡 → 转发 → 解析 sessionid 建映射 → 原样返回响应。"""
+    opt = state.opt
+    attempts = 0
+    w = await _pick_offer_worker(opt)
+    while True:
+        if w is None:
+            w = await _wait_pick_offer_worker(opt)
+        if w is None:
+            starting = any(x.alive and not x.ready for x in state.workers)
+            summary = ', '.join(
+                "gpu%s=%d/%d%s" % (x.gpu_id, x.sessions, opt.lb_max_session_per_gpu,
+                                   '' if x.ready else '(启动中)')
+                for x in state.workers)
+            if starting:
+                logger.warning('LB: worker 启动中/重启中（%s），已排队等待仍未就绪', summary)
+            else:
+                logger.warning('LB: 所有 worker 均已满员（%s），拒绝新会话', summary)
+            return _queue_response(
+                '数字人服务正在启动，正在为您排队，请稍候…' if starting
+                else '当前线路资源已满，正在为您排队，请稍候…')
+        try:
+            resp = await _forward(w, request)
+        finally:
+            w.reserved = max(0, w.reserved - 1)
+        if resp.status == 502 and attempts < 1:
+            # worker 在转发途中退出（Server disconnected）：标记不健康、作废路由，换一个重试
+            logger.warning('LB: 转发 /offer 到 worker gpu %s 失败，换 worker 重试', w.gpu_id)
+            w.ready = False
+            w.sessions = 0
+            _drop_routes_of(w)
+            attempts += 1
+            w = None
+            continue
+        if resp.status == 502:
+            # 重试后仍失败：按“恢复中”排队，前端会自动重试，不再抛英文原文
+            return _queue_response('数字人服务正在恢复，正在为您排队，请稍候…')
         if resp.status == 200 and resp.body:
             sid = None
             try:
@@ -390,8 +492,6 @@ async def _handle_offer(request):
                 # 失败/超时响应体无 sessionid：不建映射（重试/原样透传给客户端）
                 logger.info('LB: /offer 转发完成但无 sessionid（status=%s）', resp.status)
         return resp
-    finally:
-        w.reserved = max(0, w.reserved - 1)
 
 
 def _remove_route(sid, w):
@@ -420,7 +520,7 @@ async def _handle_warmup(request):
              if not isinstance(r, Exception) and r[1] == 200)
     logger.info('LB: /warmup 广播完成 ok=%d/%d', ok, len(results))
     if ok == 0:
-        return _json_err('warmup failed on all workers')
+        return _json_err('warmup failed on all workers', status=502)  # [fix-publish-webrtc]:603c6866d3
     return web.json_response({'code': 0, 'msg': 'ok',
                               'data': {'warmed': ok, 'total': len(results)}})
 

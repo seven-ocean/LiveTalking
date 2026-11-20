@@ -7,6 +7,13 @@ set -u
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$DIR" || exit 1
 
+# 现场性能参数（由 fix-perf 安装脚本生成；不存在时使用代码默认值）
+PERF_ENV="${ZL_TALK_PERF_ENV:-$DIR/../runtime/conf/talk-perf.env}"
+if [ -f "$PERF_ENV" ]; then
+  # shellcheck disable=SC1090
+  . "$PERF_ENV"
+fi
+
 PY="${1:?usage: run_talking.sh <python> <app args...>}"
 shift
 

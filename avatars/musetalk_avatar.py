@@ -58,11 +58,12 @@ logger.info('Using {} for inference.'.format(device))
 
 # ── 嘴部抖动 / 数值精度相关开关（环境变量，默认保持原行为，便于线上 A/B）──
 # MUSETALK_MOUTH_SMOOTH: 帧间 latent EMA 强度 0~0.9，0=关闭（推荐 0.3~0.4）
-# MUSETALK_LATENT_CLAMP: latent 裁剪阈值，0=不裁剪（原行为 3.5）
+# MUSETALK_LATENT_CLAMP: latent 裁剪阈值，0=不裁剪（默认，与官方一致）
+#   注意：UNet 输出正常会到 ±8，裁到 ±3.5 会压平唇缘/口腔高对比细节，导致唇色偏红
 # MUSETALK_VAE_FP32: 1=VAE 用 float32 解码（牺牲速度换取更稳定的嘴部像素）
 # MUSETALK_DEBUG_LATENT: 1=记录每批 latent 触边比例，供抖动分析
 _MOUTH_SMOOTH = min(0.9, max(0.0, float(os.getenv('MUSETALK_MOUTH_SMOOTH', '0') or 0)))
-_LATENT_CLAMP = float(os.getenv('MUSETALK_LATENT_CLAMP', '3.5') or 0)
+_LATENT_CLAMP = float(os.getenv('MUSETALK_LATENT_CLAMP', '0') or 0)
 _DEBUG_LATENT = os.getenv('MUSETALK_DEBUG_LATENT', '0') == '1'
 _VAE_FP32 = os.getenv('MUSETALK_VAE_FP32', '0') == '1'
 # VAE 解码子批大小：16 帧一次性解码在 31GB 显存配额上峰值可达 20GB+，
@@ -72,7 +73,7 @@ _VAE_CHUNK = max(1, int(os.getenv('MUSETALK_VAE_CHUNK', '4') or 4))
 # 全局推理锁：多路会话同时跑 MuseTalk 时，UNet+VAE 的峰值显存会叠加，
 # 在 31GB 显存配额下极易 OOM（表现为画面卡死）。串行化后单批仍是百毫秒级，不影响 25fps。
 _INFER_LOCK = threading.Lock()
-if _MOUTH_SMOOTH > 0 or _LATENT_CLAMP != 3.5 or _VAE_FP32:
+if _MOUTH_SMOOTH > 0 or _LATENT_CLAMP > 0 or _VAE_FP32:
     logger.info(
         "MuseTalk jitter knobs: smooth=%.2f clamp=%.2f vae_fp32=%s",
         _MOUTH_SMOOTH, _LATENT_CLAMP, _VAE_FP32,
@@ -163,9 +164,10 @@ class ONNXMuseTalkWrapper:
         # 将输出转换回 torch.Tensor（保持 float16）
         output_tensor = torch.from_numpy(outputs[0]).to(device=device, dtype=torch.float16)
         
-        # MetaX ONNX 兼容: 对 latent 值做裁剪，防止极端值导致 VAE 解码退化（画面模糊）
-        # 正常 SD VAE latent 范围约 [-3, 3]，超出 ±3.5 会触发 VAE clamp(0,1) 截断像素细节
-        output_tensor = torch.clamp(output_tensor, -3.5, 3.5)
+        # latent 裁剪由 MUSETALK_LATENT_CLAMP 统一控制（默认 0=不裁剪，与官方一致）。
+        # 过窄的阈值会让唇缘/口腔高对比元素被削平，表现为唇色更红更平。
+        if _LATENT_CLAMP > 0:
+            output_tensor = torch.clamp(output_tensor, -_LATENT_CLAMP, _LATENT_CLAMP)
         
         t3 = time.time()
         
@@ -262,7 +264,11 @@ def load_onnx_model(onnx_path, vae_onnx_path=None):
         vae.vae = vae.vae.half().to(device)
     
     # Initialize audio processor
-    audio_processor = Audio2Feature(model_path="./models/musetalk/whisper")
+    audio_processor = Audio2Feature(
+        model_path="./models/musetalk/whisper",
+        use_onnx=True,
+        onnx_model_path="./models/onnx/musetalk/whisper_encoder.onnx",
+    )
     
     return vae, unet, pe, timesteps, audio_processor
 
@@ -287,7 +293,7 @@ def load_avatar(avatar_id):
         mask_coords_list_cycle = pickle.load(f)
     input_mask_list = glob.glob(os.path.join(mask_out_path, '*.[jpJP][pnPN]*[gG]'))
     input_mask_list = sorted(input_mask_list, key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))
-    mask_list_cycle = read_imgs(input_mask_list)
+    mask_list_cycle = read_imgs(input_mask_list, grayscale=True)
     return frame_list_cycle,mask_list_cycle,coord_list_cycle,mask_coords_list_cycle,input_latent_list_cycle
 
 @torch.no_grad()
@@ -438,7 +444,7 @@ class MuseReal(BaseAvatar):
 
     def paste_back_frame(self,pred_frame,idx:int):
         bbox = self.coord_list_cycle[idx]
-        ori_frame = copy.deepcopy(self.frame_list_cycle[idx])
+        ori_frame = self.frame_list_cycle[idx].copy()
         x1, y1, x2, y2 = bbox
 
         res_frame = cv2.resize(pred_frame.astype(np.uint8),(x2-x1,y2-y1))

@@ -65,9 +65,9 @@ class BaseASR:
 
     def put_audio_frame(self,audio_chunk:NDArray[np.float32],datainfo:dict,
                         utt_id:str='',chunk_index:int=-1,
-                        data32:NDArray[np.float32]=None): #16khz 20ms pcm
+                        data_play:NDArray[np.float32]=None): #16khz 20ms pcm
         self.queue.put(AudioFrameData(data=audio_chunk,type=0,userdata=datainfo,
-                                      data32=data32,
+                                      data_play=data_play,
                                       utt_id=utt_id,chunk_index=chunk_index))
 
     def _pace_frame(self):
@@ -83,13 +83,20 @@ class BaseASR:
         wait = next_ts - now
         if wait > 0:
             time.sleep(wait)
-        self._next_frame_ts = next_ts + self.chunk / self.sample_rate
-        if self._next_frame_ts < time.monotonic() - 0.1:
-            self._next_frame_ts = time.monotonic()
+            base = next_ts
+        else:
+            # 落后就重置基准，**不补帧**。
+            # 补帧会让生产速度略高于 50 帧/秒，而 WebRTC 音频轨固定按 20ms 消费，
+            # 队列就会持续积压（现场实测 aq 每秒 +2），声音越来越滞后、满了就吞字。
+            base = now
+        self._next_frame_ts = base + self.chunk / self.sample_rate
 
     #return frame:audio pcm; type: 0-normal speak, 1-silence; eventpoint:custom event sync with audio
     def get_audio_frame(self)->AudioFrameData:        
-        self._pace_frame()
+        # legacy：逐帧 20ms 限速（现状）；official / sync25：不逐帧限速，
+        # 交给 render 的水位背压（逐帧限速会把产出钉在实时甚至略慢 → 播放端持续欠载）
+        if getattr(self.parent, 'pacing_mode', 'legacy') not in ('official', 'sync25'):
+            self._pace_frame()
         audiotype = self.parent.custom_audiotype if self.parent else 0
         try:
             # 仅当当前动作「配有固定音频」（如思考 think）时优先播放固定音频；

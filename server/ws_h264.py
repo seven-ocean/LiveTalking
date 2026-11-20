@@ -135,6 +135,7 @@ class H264Encoder:
             "-s", "%dx%d" % (self.width, self.height),
             "-r", str(self.fps), "-i", "pipe:0",
             "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+            "-threads", str(max(1, int(os.environ.get("WS_VIDEO_X264_THREADS", "2")))),
             "-profile:v", "baseline", "-pix_fmt", "yuv420p",
             "-g", str(self._gop), "-keyint_min", str(self._gop), "-sc_threshold", "0",
             "-b:v", str(self.bitrate), "-maxrate", str(int(self.bitrate * 1.2)),

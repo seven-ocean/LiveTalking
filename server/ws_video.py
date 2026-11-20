@@ -24,10 +24,11 @@ import time
 import cv2
 import numpy as np
 import resampy
+import soxr
 from aiohttp import WSMsgType, web
 
 from server.session_manager import session_manager
-from server.webrtc import HumanPlayer
+from server.webrtc import HumanPlayer, PLAYBACK_RATE
 from server.ws_h264 import BIN_H264, H264Encoder
 from utils.logger import logger
 
@@ -53,9 +54,11 @@ def _env_float(name: str, default: float) -> float:
 # 不支持 WebCodecs 的浏览器回落 JPEG（以下参数用于该兜底路径）。
 JPEG_QUALITY = _env_int("WS_VIDEO_JPEG_QUALITY", 60)
 VIDEO_SCALE = _env_float("WS_VIDEO_SCALE", 0.75)
-VIDEO_BITRATE = _env_int("WS_VIDEO_BITRATE", 2_000_000)
+VIDEO_BITRATE = _env_int("WS_VIDEO_BITRATE", 4_000_000)
 # 可选：WS 降级通道单独限制帧率（0=跟随数字人 25fps）。低配客户端可用 20 换取稳定。
 WS_FPS = _env_int("WS_VIDEO_FPS", 0)
+# WS 自建会话默认保留一段时间供重连复用；0=旧行为（断开即销毁）
+_KEEP_WS_SESSION = os.environ.get("TALK_WS_KEEP_SESSION", "1").strip().lower() not in ("0", "false", "no", "off")
 DEFAULT_W, DEFAULT_H, DEFAULT_FPS = 256, 256, 25
 # 等首帧的超时：形象冷加载可能较久，这里只在渲染线程已能出帧时才会很快返回
 FIRST_FRAME_TIMEOUT = 20.0
@@ -63,7 +66,9 @@ MAX_WS_MSG = 8 * 1024 * 1024
 # 单次 WS 写入的超时。客户端掉线（尤其是半开连接：TCP 已断但没有 FIN/RST）时，
 # send_bytes 会一直卡在写满的发送缓冲上，整个 handler 永远进不了 finally ——
 # 表现为编码进程和渲染线程一直泄漏、后台持续吃 CPU。
-WS_SEND_TIMEOUT = 5.0
+# 单次 WS 写入的超时。客户端切桌面/窗口被节流时可能暂时不读 socket，
+# 超时太短（原 5s）会被服务端主动断开；放宽到 60s，切回来还能继续。
+WS_SEND_TIMEOUT = _env_float("WS_SEND_TIMEOUT", 300.0)
 
 BIN_JPEG = 0x01
 BIN_PCM = 0x02
@@ -88,6 +93,7 @@ def snapshot_stats(sessionid, player, video_slot, stats, h264, codec):
             'aus_sent': int(stats.get('aus_sent', 0)),
             'audio_sent': int(stats.get('audio_sent', 0)),
             'silence_sent': int(stats.get('silence_sent', 0)),
+            'audio_lead': int(stats.get('audio_lead', 0)),
             'enc': es,
             'server_dropped': int(
                 stats.get('feed_none', 0)
@@ -131,22 +137,62 @@ def _latest_session_with_player():
 
 async def ws_video(request: web.Request) -> web.WebSocketResponse:
     query_sid = (request.query.get("sessionid") or "").strip()
+    req_avatar = (request.query.get("avatar") or "").strip()
+    req_refaudio = (request.query.get("refaudio") or "").strip()
+    req_reftext = (request.query.get("reftext") or "").strip()
     want_h264 = (request.query.get("codec") or "jpeg").lower() == "h264"
+    # 音频速率协商：客户端按自身设备原生率请求（auto），老桌面端不传则按 16k 兜底。
+    # 真正的取值在 player 就绪后再定（要参考本会话的生产口径）。
+    try:
+        _req_audio_rate = int(request.query.get("audio_rate", "") or 0)
+    except (TypeError, ValueError):
+        _req_audio_rate = 0
 
     sessionid, avatar_session, player = (None, None, None)
+    own_session = False
     if query_sid:
         avatar_session, player = _player_of(query_sid)
+        if avatar_session is not None and req_avatar:
+            cur_avatar = str(getattr(getattr(avatar_session, "opt", None), "avatar_id", "") or "")
+            if cur_avatar and cur_avatar != req_avatar:
+                # 旧会话形象与页面当前形象不一致（例如被回收后重建成了默认形象），不能复用
+                logger.info(
+                    "ws_video: sessionid=%s 形象 %s != 请求 %s，丢弃旧会话",
+                    query_sid, cur_avatar, req_avatar,
+                )
+                avatar_session = None
+                player = None
         sessionid = query_sid if avatar_session is not None else None
         if avatar_session is None:
-            logger.warning("ws_video: sessionid=%s 不存在，尝试复用最近会话", query_sid)
-    if avatar_session is None:
+            logger.warning("ws_video: sessionid=%s 不存在或形象不匹配，尝试按请求形象新建", query_sid)
+
+    if avatar_session is None and req_avatar:
+        # 页面明确带了形象：不要用“最近会话”兜底，否则会套到别的形象上
+        try:
+            params = {"avatar": req_avatar}
+            if req_refaudio:
+                params["refaudio"] = req_refaudio
+            if req_reftext:
+                params["reftext"] = req_reftext
+            sessionid = await session_manager.create_session(params)
+        except Exception:
+            logger.exception("ws_video: create_session(avatar) failed")
+            return web.Response(status=500, text="create session failed")
+        avatar_session = session_manager.get_session(sessionid)
+        own_session = True
+        player = None
+    elif avatar_session is None:
         sessionid, avatar_session, player = _latest_session_with_player()
 
-    own_session = False
     if avatar_session is None:
         # 完全没有可用会话：自建一个（此时数字人由 WS 通道单独驱动）
         try:
-            sessionid = await session_manager.create_session({})
+            params = {}
+            if req_refaudio:
+                params["refaudio"] = req_refaudio
+            if req_reftext:
+                params["reftext"] = req_reftext
+            sessionid = await session_manager.create_session(params)
         except Exception:
             logger.exception("ws_video: create_session failed")
             return web.Response(status=500, text="create session failed")
@@ -162,8 +208,30 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
     # WS 通道必须自己把渲染线程启动起来，否则一帧都产不出（表现为黑屏 + 报 256×256 占位尺寸）。
     player.ensure_worker()
 
-    # 复用（非自建）时加租约，避免 pc 因 ICE 失败销毁会话导致流中断
-    if not own_session:
+    # 音频口径协商（客户端只用 16k/44.1k/48k 三档，链路上都是标准值）：
+    #   - 会话生产口径 session_rate（能力中心「音频口径」；auto 时 48k）
+    #   - 客户端请求的设备原生率 <= session_rate 时按客户端给（避免客户端再转一次）
+    #   - 否则按 session_rate 下发（客户端上下文会自己处理）
+    #   - 老桌面端不传 audio_rate → 16k（它们按 16k 解）
+    try:
+        session_rate = int(getattr(player, "audio_rate", 0) or PLAYBACK_RATE)
+    except (TypeError, ValueError):
+        session_rate = PLAYBACK_RATE
+    _RATES = (16000, 44100, 48000)
+    if session_rate not in _RATES:
+        session_rate = 48000 if session_rate > 44100 else 16000
+    if _req_audio_rate in _RATES:
+        audio_rate = min(_req_audio_rate, session_rate)
+    elif _req_audio_rate == 0:
+        audio_rate = 16000
+    else:
+        audio_rate = session_rate
+    out_chunk = max(1, int(audio_rate * 0.02))
+    logger.info("ws_video: audio profile session=%d client=%s -> %d Hz (%d samples/frame)",
+                session_rate, _req_audio_rate or "unset(16k)", audio_rate, out_chunk)
+
+    # 复用或自建但保留的 WS 会话都加租约：断开后保留 10s，重连直接复用，避免重新加载形象
+    if not own_session or _KEEP_WS_SESSION:
         session_manager.lease_session(sessionid)
 
     # 直接读 WS 专属帧源（push_video/push_audio 额外复制的那一份），
@@ -252,13 +320,32 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
         logger.warning("ws_video: 未取到首帧，按形象真实尺寸上报 %dx%d（渲染线程刚启动时会这样，前端可从后续帧自校正）",
                        fw, fh)
 
-    fps = WS_FPS or int(getattr(request.app.get("opt"), "fps", None) or DEFAULT_FPS)
+    # 画质档位：优先用本会话参数（能力中心「画质档位」），与 WebRTC 同档，
+    # 这样两条通道切换时观感一致。URL &scale= 仍可临时覆盖。
+    _opt = getattr(avatar_session, "opt", None)
+    _sess_fps = int(getattr(_opt, "video_fps", 0) or 0)
+    _sess_scale = float(getattr(_opt, "webrtc_scale", 0) or 0)
+    _sess_bitrate = int(getattr(_opt, "video_bitrate", 0) or 0)
+    # 会话（能力中心画质档位）优先；env 只在会话没指定时兜底。
+    # 注意：aihuman.env 里 WS_VIDEO_FPS=25 是历史默认值，不能被它压过档位。
+    fps = _sess_fps or WS_FPS or int(getattr(request.app.get("opt"), "fps", None) or DEFAULT_FPS)
+    logger.info("ws_video: quality fps=%s scale=%s bitrate=%s (env fps=%s scale=%s bitrate=%s)",
+                _sess_fps, _sess_scale, _sess_bitrate, WS_FPS, VIDEO_SCALE, VIDEO_BITRATE)
     frame_interval = 1.0 / max(1, fps)
-    if VIDEO_SCALE and abs(VIDEO_SCALE - 1.0) > 0.01:
+    # 每连接缩放：老机器可用 &scale=0.65 降低解码/绘制压力，把 CPU 让给音频
+    scale = _sess_scale or VIDEO_SCALE
+    bitrate = _sess_bitrate or VIDEO_BITRATE
+    try:
+        _req_scale = float(request.query.get("scale", "") or 0)
+        if 0.4 <= _req_scale <= 1.0:
+            scale = _req_scale
+    except (TypeError, ValueError):
+        pass
+    if scale and abs(scale - 1.0) > 0.01:
         # libx264 + yuv420p 要求宽高为偶数；四舍五入可能得到 675 这类奇数，
         # 会让 H.264 启动失败并回落到 JPEG（前端因此表现为降级通道连接不稳定）。
-        fw = max(2, int(round(fw * VIDEO_SCALE / 2.0)) * 2)
-        fh = max(2, int(round(fh * VIDEO_SCALE / 2.0)) * 2)
+        fw = max(2, int(round(fw * scale / 2.0)) * 2)
+        fh = max(2, int(round(fh * scale / 2.0)) * 2)
 
     # 帧本来就是从 BGR ndarray 建的（HumanPlayer.push_video），to_ndarray 是零拷贝视图；
     # 缩放用 cv2.resize（0.3ms），比 libswscale 的 reformat（约 4ms）快一个数量级。
@@ -294,7 +381,7 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
     if want_h264:
         try:
             loop = asyncio.get_running_loop()
-            h264 = H264Encoder(int(fw), int(fh), fps=fps, bitrate=VIDEO_BITRATE)
+            h264 = H264Encoder(int(fw), int(fh), fps=fps, bitrate=bitrate)
             h264_ready = False
 
             def _on_h264_exit():
@@ -328,7 +415,7 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
         "sessionid": sessionid,
         "codec": "h264" if h264 is not None else "jpeg",
         "video": {"w": int(fw), "h": int(fh), "fps": fps},
-        "audio": {"rate": 16000, "channels": 1, "format": "s16le"},
+        "audio": {"rate": audio_rate, "channels": 1, "format": "s16le"},
     }
     if h264 is not None:
         ready["video"].update({
@@ -337,11 +424,11 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
         })
     await send_json(ready)
     if h264 is not None:
-        logger.info("ws_video: ready %dx%d @%d fps，H.264 %s %d bps，音频 16000 Hz",
-                    int(fw), int(fh), fps, h264.codec_string, VIDEO_BITRATE)
+        logger.info("ws_video: ready %dx%d @%d fps，H.264 %s %d bps，音频 %d Hz",
+                    int(fw), int(fh), fps, h264.codec_string, bitrate, audio_rate)
     else:
-        logger.info("ws_video: ready %dx%d @%d fps，JPEG 质量 %d，音频 16000 Hz",
-                    int(fw), int(fh), fps, JPEG_QUALITY)
+        logger.info("ws_video: ready %dx%d @%d fps，JPEG 质量 %d，音频 %d Hz",
+                    int(fw), int(fh), fps, JPEG_QUALITY, audio_rate)
 
     if h264 is None and first_frame is not None:
         data = await asyncio.to_thread(encode_jpeg, first_frame)
@@ -425,10 +512,13 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
         # 不节拍的话，TTS 整段音频会瞬间灌满 socket 并长时间占住 send_lock，
         # 视频 pump 排不上队 → 大面积丢帧（实测丢 30%+）。
         ptime = 0.02
+        ws_rs = (soxr.ResampleStream(session_rate, audio_rate, 1, dtype='float32')
+                 if session_rate != audio_rate else None)
+        pending_pcm = np.zeros(0, dtype=np.float32)
+        audio_gen = getattr(player, "_audio_gen", 0)
         a_start = time.monotonic()
         a_slot = 0
         pending = None  # 已取出、但对应视频还没发出去的那段音频
-        silence = bytes((BIN_PCM,)) + b"\x00" * 320 * 2
         while not ws.closed:
             if paused[0]:
                 pending = None
@@ -452,21 +542,45 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
             a_slot += 1
 
             frame, seq = pending
+            # 新一句话开始：清掉上一轮重采样缓冲，避免先播出旧静音
+            cur_gen = getattr(player, "_audio_gen", 0)
+            if cur_gen != audio_gen:
+                audio_gen = cur_gen
+                pending_pcm = np.zeros(0, dtype=np.float32)
+                if ws_rs is not None:
+                    ws_rs = soxr.ResampleStream(session_rate, audio_rate, 1, dtype='float32')
             if seq >= 0:
-                # 门控：这段音频对应的视频帧必须先发出去。视频落后时最多等 200ms，
-                # 超时就用静音占住当前 20ms 槽位（而不是丢掉音频）——宁可声音稍晚，
-                # 也不能让声音跑到口型前面。pending 保留，下个槽位继续等。
-                deadline = time.monotonic() + 0.2
+                # 只给视频一个很短的追赶窗口；超时也继续发音频。
+                # 用静音占位/丢音频在弱客户端上会变成“电音、断音”，音频连续优先。
+                deadline = time.monotonic() + 0.02
                 while player.ws_video_sent_seq < seq and time.monotonic() < deadline:
                     await asyncio.sleep(0.005)
                 if player.ws_video_sent_seq < seq:
-                    _stats['silence_sent'] += 1
-                    await send_bytes(silence)
-                    continue
+                    _stats['audio_lead'] = _stats.get('audio_lead', 0) + 1
+                # 上面等待消耗的是墙钟，但只推进了一个 20ms 槽位。视频持续落后时
+                # 每个槽位会被拉长到 20+20ms，音频下发速率掉到 25 帧/秒 → 客户端饿死。
+                # 等完把槽位对齐到真实时间，保证恒定 50 帧/秒。
+                now2 = time.monotonic()
+                if now2 - (a_start + a_slot * ptime) > ptime:
+                    a_slot = int((now2 - a_start) / ptime)
 
-            # 全链路统一 16k（server/webrtc.py SAMPLE_RATE=16000），直接发送，不再重采样
-            arr = frame.to_ndarray()
-            pcm = arr.tobytes() if arr.dtype == np.int16 else arr.astype(np.int16).tobytes()
+            # 播放帧按会话口径（48k/44.1k/16k）；和客户端请求率不一致时用有状态重采样。
+            # soxr 的输出不是按 20ms 对齐的，必须自己缓冲成 out_chunk 样本/帧；
+            # 输入要先归一化到 [-1,1]，否则 clip 会把声音削成几乎静音。
+            arr = frame.to_ndarray().reshape(-1)
+            if ws_rs is not None:
+                out = ws_rs.resample_chunk(arr.astype(np.float32) / 32768.0, last=False)
+                if out.size:
+                    pending_pcm = np.concatenate((pending_pcm, out.astype(np.float32)))
+                if pending_pcm.size >= out_chunk:
+                    chunk = pending_pcm[:out_chunk]
+                    pending_pcm = pending_pcm[out_chunk:]
+                else:
+                    # 重采样输出不满一帧时补零，但不能丢样本（否则时间轴会被拉长）
+                    chunk = np.zeros(out_chunk, dtype=np.float32)
+                pcm = (np.clip(chunk, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+            else:
+                pcm = arr.tobytes() if arr.dtype == np.int16 else arr.astype(np.int16).tobytes()
             await send_bytes(bytes((BIN_PCM,)) + pcm)
             _stats['audio_sent'] += 1
             pending = None
@@ -516,7 +630,7 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
     # 持续解码/绘制，也避免 socket 积压（多开时把资源让给可见的那一路）。
     paused = [False]
     _stats = {'feed_pops': 0, 'feed_none': 0, 'aus_sent': 0,
-              'audio_sent': 0, 'silence_sent': 0}
+              'audio_sent': 0, 'silence_sent': 0, 'audio_lead': 0}
 
     async def _stats_loop():
         while not ws.closed:
@@ -576,18 +690,20 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
         except Exception:
             logger.debug("ws_video: release_worker failed", exc_info=True)
 
-        if own_session:
+        if own_session and not _KEEP_WS_SESSION:
             session_manager.stop_session(sessionid)
             session_manager.remove_session(sessionid)
         else:
-            # 只释放 WS 租约，**不立即销毁会话**：
-            #   1. WS 模式下 pc 因 UDP 被封必然 failed，断开后重连或下一次测试应复用
-            #      已加载的形象模型；立即销毁会导致每次重连都重新加载（实测约 11s，
-            #      表现为“发完文字半天不回复”）。
-            #   2. 泄漏由 app.py 的空闲回收任务兜底（无租约、无活 pc、空闲超时）。
-            session_manager.release_session(sessionid)
-            session_manager.touch(sessionid)
-            logger.info("ws_video: 会话保留待复用 sessionid=%s", sessionid)
+            # 只释放 WS 租约，**不立即销毁会话**（pc 失败时保留热会话，重连更快）；
+            # 但若 pc 在租约期间已经关闭并登记了 pending_destroy，这里要立刻补做销毁。
+            need_destroy = session_manager.release_session(sessionid)
+            if need_destroy:
+                session_manager.stop_session(sessionid)
+                session_manager.remove_session(sessionid)
+                logger.info("ws_video: 租约释放后补做销毁 sessionid=%s", sessionid)
+            else:
+                session_manager.touch(sessionid)
+                logger.info("ws_video: 会话保留待复用 sessionid=%s", sessionid)
         snapshot_stats(sessionid, player, video_slot, _stats, h264,
                        'h264' if h264 is not None else 'jpeg')
         try:
@@ -596,11 +712,12 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
             logger.info(
                 "[ws-stats] sessionid=%s produced_video=%d produced_audio=%d "
                 "ws_slot=%s feed_pops=%d feed_none=%d aus_sent=%d "
-                "audio_sent=%d silence_sent=%d enc=%s",
+                "audio_sent=%d silence_sent=%d audio_lead=%d enc=%s",
                 sessionid, getattr(player, 'produced_video', -1),
                 getattr(player, 'produced_audio', -1), vs,
                 _stats['feed_pops'], _stats['feed_none'], _stats['aus_sent'],
-                _stats['audio_sent'], _stats['silence_sent'], es,
+                _stats['audio_sent'], _stats['silence_sent'],
+                _stats.get('audio_lead', 0), es,
             )
         except Exception:
             logger.debug("ws_video: stats log failed", exc_info=True)

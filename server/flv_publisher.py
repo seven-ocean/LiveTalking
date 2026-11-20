@@ -21,8 +21,8 @@ from utils.logger import logger
 
 VIDEO_PTIME = 0.04
 AUDIO_PTIME = 0.02
-SAMPLE_RATE = 16000
-AUDIO_CHUNK_BYTES = int(SAMPLE_RATE * AUDIO_PTIME) * 2  # 320 samples s16le = 640B
+SAMPLE_RATE = 48000  # 与 WebRTC/WS 播放口径一致（48k），避免再转一次
+AUDIO_CHUNK_BYTES = int(SAMPLE_RATE * AUDIO_PTIME) * 2  # 960 samples s16le = 1920B
 FIRST_FRAME_TIMEOUT = 15.0
 
 

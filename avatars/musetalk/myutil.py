@@ -11,10 +11,14 @@ def get_image_blending(image,face,face_box,mask_array,crop_box):
     body = image
     x, y, x1, y1 = face_box
     x_s, y_s, x_e, y_e = crop_box
-    face_large = copy.deepcopy(body[y_s:y_e, x_s:x_e])
+    face_large = body[y_s:y_e, x_s:x_e].copy()
     face_large[y-y_s:y1-y_s, x-x_s:x1-x_s]=face
 
-    mask_image = cv2.cvtColor(mask_array,cv2.COLOR_BGR2GRAY)
+    if mask_array.ndim == 3:
+        mask_image = cv2.cvtColor(mask_array,cv2.COLOR_BGR2GRAY)
+    else:
+        # 灰度掩码（read_imgs grayscale=True）直接使用，省 2/3 内存
+        mask_image = mask_array
     mask_image = (mask_image/255).astype(np.float32)
     if _MASK_BLUR > 1:
         k = _MASK_BLUR if _MASK_BLUR % 2 == 1 else _MASK_BLUR + 1

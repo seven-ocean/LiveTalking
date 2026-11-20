@@ -28,6 +28,7 @@ import time
 import cv2
 import glob
 import resampy
+import soxr
 import queue
 from queue import Queue
 from threading import Thread, Event
@@ -48,6 +49,10 @@ from fractions import Fraction
 from utils.logger import logger
 from utils.image import read_imgs,mirror_index
 
+# 每帧右下角/左上角水印：默认关闭，避免每帧多一次绘制与像素拷贝
+_FRAME_WATERMARK = os.environ.get("ZL_FRAME_WATERMARK", "0").strip().lower() in (
+    "1", "true", "yes", "on")
+
 # class State(Enum):
 #     INIT=0
 #     WAIT=1
@@ -59,18 +64,39 @@ class AudioFrameData:
     data: NDArray[np.float32]
     type: int = 0  # 默认值
     userdata: dict = field(default_factory=dict)
-    # 全链路统一 16k：data 同时用于口型和播放，不再保留 32k 副本。
-    data32: NDArray[np.float32] = None
+    # 播放采样（TTS 原生/44.1k）；data 仍为 16k，用于口型/ASR
+    data_play: NDArray[np.float32] = None
     # 整句（utterance）元数据：TTS 整段 wav 一次性入队时标记句号与块序号，
     # 供 MuseTalk 按整句 whisper 特征切口型条件（官方等价做法）。
     utt_id: str = ''
     chunk_index: int = -1
+
+
 
 class BaseAvatar:
     def __init__(self, opt):
         self.opt = opt
         self.sample_rate = 16000
         self.chunk = self.sample_rate // (opt.fps*2) # 320 samples per chunk (20ms)
+        # 产出节流模式：legacy=严格按 batch/fps 节拍；
+        # official=官方 LiveTalking"跑在前面+队列背压"；bounded=双队列有界背压；
+        # sync25=视频与推理同频 25fps、按音频水位背压。
+        self.pacing_mode = str(getattr(opt, 'pacing', '') or 'legacy').strip().lower()
+        if self.pacing_mode not in ('legacy', 'official', 'bounded', 'sync25'):
+            self.pacing_mode = 'legacy'
+        # 播放采样率统一 48k：WebRTC/Opus 与多数声卡的原生时钟都是 48k，
+        # 这样播放链路两端都不需要重采样；口型/ASR 仍是 16k（只转一次，不在播放路径）。
+        # 口径优先级：本会话参数（能力中心「音频口径」）> 部署环境变量 > 48k
+        try:
+            self.playback_rate = int(
+                getattr(opt, 'playback_rate', 0)
+                or os.environ.get("TALK_PLAYBACK_SR", "48000")
+                or 48000)
+        except (TypeError, ValueError):
+            self.playback_rate = 48000
+        self.play_chunk = max(1, self.playback_rate // (opt.fps*2))
+        # 播放侧有状态重采样器（只有帧没有 data_play 时才用，如待机静音/固定音频）
+        self._play_rs = None
         self.sessionid = self.opt.sessionid
 
         self.speaking = False
@@ -115,6 +141,10 @@ class BaseAvatar:
         _output_modules = {
             'webrtc': 'streamout.webrtc',
             'rtcpush': 'streamout.webrtc',
+            # 客户端 WS 降级通道：帧由 player 的 ws 槽位提供，输出模块仍需存在，
+            # 否则 process_frames 会因为没有 self.output 直接崩掉。
+            'ws': 'streamout.webrtc',
+            'websocket': 'streamout.webrtc',
             'rtmp': 'streamout.rtmp',
             'virtualcam': 'streamout.virtualcam'
         }
@@ -136,11 +166,11 @@ class BaseAvatar:
     
     def put_audio_frame(self, audio_chunk:NDArray[np.float32], datainfo:dict={},
                         utt_id:str='', chunk_index:int=-1,
-                        data32:NDArray[np.float32]=None): # 16khz 20ms pcm
+                        data_play:NDArray[np.float32]=None): # 16khz 20ms pcm
         if hasattr(self, 'asr'):
             self.asr.put_audio_frame(audio_chunk, datainfo,
                                      utt_id=utt_id, chunk_index=chunk_index,
-                                     data32=data32)
+                                     data_play=data_play)
 
     def _next_utt_id(self) -> str:
         self._utt_seq = getattr(self, '_utt_seq', 0) + 1
@@ -150,14 +180,16 @@ class BaseAvatar:
 
     def put_audio_file(self, filebyte, datainfo:dict={}): 
         self.interrupted = False  # 每个新文件开始时重置
-        # 全链路统一 16k：一次重采样到 self.sample_rate，口型和播放共用同一份采样
+        # 口型/ASR 用 16k；播放用 TTS 原生/44.1k，避免 44.1→16 的带宽裁切
         stream = self.__create_bytes_stream(BytesIO(filebyte))
+        stream_play = self.__create_bytes_stream_play(BytesIO(filebyte))
         # 整句登记：MuseTalk 需要按整句算一次 whisper 特征（官方等价做法）
         utt_id = self._next_utt_id()
         if hasattr(self.asr, 'set_utterance'):
             self.asr.set_utterance(utt_id, stream)
         streamlen = stream.shape[0]
         idx = 0
+        idx_play = 0
         first = True
         while streamlen >= self.chunk:
             if self.interrupted:
@@ -171,19 +203,26 @@ class BaseAvatar:
             if streamlen - self.chunk < self.chunk:
                 eventpoint = {'status': 'end'}
             eventpoint.update(**datainfo)
+            dplay = stream_play[idx_play:idx_play+self.play_chunk]
+            if dplay.shape[0] < self.play_chunk:
+                dplay = np.pad(dplay, (0, self.play_chunk - dplay.shape[0]))
             self.put_audio_frame(stream[idx:idx+self.chunk], eventpoint,
-                                 utt_id=utt_id, chunk_index=idx // self.chunk)
+                                 utt_id=utt_id, chunk_index=idx // self.chunk,
+                                 data_play=dplay)
             streamlen -= self.chunk
             idx += self.chunk
+            idx_play += self.play_chunk
 
     def put_audio_filepath(self, filepath, datainfo:dict={}): 
         self.interrupted = False  # 每个新文件开始时重置
         stream = self.__create_bytes_stream(filepath)
+        stream_play = self.__create_bytes_stream_play(filepath)
         utt_id = self._next_utt_id()
         if hasattr(self.asr, 'set_utterance'):
             self.asr.set_utterance(utt_id, stream)
         streamlen = stream.shape[0]
         idx = 0
+        idx_play = 0
         first = True
         while streamlen >= self.chunk:
             if self.interrupted:
@@ -197,21 +236,16 @@ class BaseAvatar:
             if streamlen - self.chunk < self.chunk:
                 eventpoint = {'status': 'end'}
             eventpoint.update(**datainfo)
+            dplay = stream_play[idx_play:idx_play+self.play_chunk]
+            if dplay.shape[0] < self.play_chunk:
+                dplay = np.pad(dplay, (0, self.play_chunk - dplay.shape[0]))
             self.put_audio_frame(stream[idx:idx+self.chunk], eventpoint,
-                                 utt_id=utt_id, chunk_index=idx // self.chunk)
+                                 utt_id=utt_id, chunk_index=idx // self.chunk,
+                                 data_play=dplay)
             streamlen -= self.chunk
             idx += self.chunk
+            idx_play += self.play_chunk
 
-    def __create_bytes_stream32(self, byte_stream):
-        stream, sample_rate = sf.read(byte_stream)
-        logger.info(f'[INFO]put audio stream {sample_rate}: {stream.shape} (hq 32k)')
-        stream = stream.astype(np.float32)
-        if stream.ndim > 1:
-            logger.info(f'[WARN] audio has {stream.shape[1]} channels, only use the first.')
-            stream = stream[:, 0]
-        if sample_rate != 32000 and stream.shape[0] > 0:
-            stream = resampy.resample(x=stream, sr_orig=sample_rate, sr_new=32000)
-        return stream
     
     def __create_bytes_stream(self, byte_stream):
         stream, sample_rate = sf.read(byte_stream) # [T*sample_rate,] float64
@@ -226,6 +260,18 @@ class BaseAvatar:
             logger.info(f'[WARN] audio sample rate is {sample_rate}, resampling into {self.sample_rate}.')
             stream = resampy.resample(x=stream, sr_orig=sample_rate, sr_new=self.sample_rate)
 
+        return stream
+
+    def __create_bytes_stream_play(self, byte_stream):
+        """播放采样：保留 TTS 原生；非 48k 时整句只重采样一次到 playback_rate。"""
+        stream, sample_rate = sf.read(byte_stream)
+        stream = stream.astype(np.float32)
+        if stream.ndim > 1:
+            stream = stream[:, 0]
+        if sample_rate != self.playback_rate and stream.shape[0] > 0:
+            logger.info('[INFO] playback resample %s -> %s (once per file)',
+                        sample_rate, self.playback_rate)
+            stream = soxr.resample(stream, sample_rate, self.playback_rate)
         return stream
 
     def flush_talk(self):
@@ -353,7 +399,7 @@ class BaseAvatar:
                     '-y', '-vn',
                     '-f', 's16le',
                     '-ac', '1',
-                    '-ar', '32000',
+                    '-ar', '48000',
                     '-i', '-',
                     '-acodec', 'aac',
                     f'temp{self.opt.sessionid}.aac']
@@ -618,18 +664,35 @@ class BaseAvatar:
                 else:
                     combine_frame = current_frame
 
-            cv2.putText(combine_frame, "zl-talking", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (128,128,128), 1)
+            if _FRAME_WATERMARK:
+                cv2.putText(combine_frame, "zl-talking", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (128,128,128), 1)
             
             # 使用统一输出接口推送视频帧
             self.output.push_video_frame(combine_frame)
             self.record_video_data(combine_frame)
 
             for audio_frame in audio_frames:
-                # 全链路统一 16k：播放通道直接使用 16k 采样，不再升到 32k 再降回来
-                frame = (audio_frame.data * 32767).astype(np.int16)
-
-                # 使用统一输出接口推送音频帧
-                self.output.push_audio_frame(frame, audio_frame.userdata)
+                # 口型/ASR 用 16k 的 data；播放用 data_play（TTS 原生/44.1k）
+                play = getattr(audio_frame, 'data_play', None)
+                if play is None:
+                    play = audio_frame.data
+                    if self.playback_rate != self.sample_rate and play.shape[0] > 0:
+                        # 逐帧做无状态重采样会在每个 20ms 边界留下一次瞬态（电流音）。
+                        # 这里改成每个会话一个有状态重采样器，跨帧连续。
+                        if self._play_rs is None:
+                            self._play_rs = soxr.ResampleStream(
+                                self.sample_rate, self.playback_rate, 1, dtype='float32')
+                        play = self._play_rs.resample_chunk(
+                            np.asarray(play, dtype='float32'), last=False)
+                        if play.shape[0] != self.play_chunk:
+                            if play.shape[0] < self.play_chunk:
+                                play = np.pad(play, (0, self.play_chunk - play.shape[0]))
+                            else:
+                                play = play[:self.play_chunk]
+                play = np.clip(play, -1.0, 1.0)
+                frame = (play * 32767).astype(np.int16)
+                self.output.push_audio_frame(frame, audio_frame.userdata,
+                                             sample_rate=self.playback_rate)
                 self.record_audio_data(frame)
                 
             # if self.opt.transport == 'virtualcam' and hasattr(self.output, '_cam') and self.output._cam:
@@ -660,11 +723,82 @@ class BaseAvatar:
         # 一轮产出 batch_size 帧，对应 batch_size/fps 秒视频 → 这是产出的时间节拍
         _round_interval = self.batch_size / float(self.asr.fps or 25)
         _deadline = time.monotonic()
+        _pacing_official = (getattr(self, 'pacing_mode', 'legacy') == 'official')
+        _pacing_bounded = (getattr(self, 'pacing_mode', 'legacy') == 'bounded')
+        _pacing_sync25 = (getattr(self, 'pacing_mode', 'legacy') == 'sync25')
         while not quit_event.is_set():
             t = time.perf_counter()
             self.asr.run_step()
             if quit_event.is_set():
                 break
+
+            if _pacing_sync25:
+                # sync25：视频轨与推理同频（25fps），音频水位维持在 0.24~0.5s：
+                #  • 水位见底（<12 帧 / WS<25）→ 立刻补产，缓冲只多不少，播放端永不欠载；
+                #  • 到顶（音频 25 帧 / WS 50 / 视频 16 帧）→ 停等，绝不丢帧
+                #    （丢帧 = 画面停一下 + 音频继续走 → 之后口型永久对不上）；
+                #  • 其余时间按 25fps 媒体节拍走。
+                # 视频队列参与背压是本轮的关键：发送端被 TURN/TCP 顶住时，
+                # 之前会把队列里的帧丢掉，现在改成让生产端等，音画时间轴保持一致。
+                _player = getattr(self.output, "_player", None)
+                _aq = 0
+                _wsq = 0
+                _vq = 0
+                if _player is not None:
+                    _t_wait = time.monotonic()
+                    while not quit_event.is_set():
+                        try:
+                            _d = _player.queue_depths()
+                        except Exception:
+                            break
+                        _aq = int(_d.get("aq", 0) or 0)
+                        _wsq = int(_d.get("wsq", 0) or 0)
+                        _vq = int(_d.get("vq", 0) or 0)
+                        # 视频队列等待最多 0.8s（音频缓冲 ≈0.6s）：发送端卡死时
+                        # 不能把音频一起饿死，超时就放行、让音频优先。
+                        _v_ok = _vq < 16 or (time.monotonic() - _t_wait) > 0.8
+                        if _aq < 25 and _wsq < 50 and _v_ok:
+                            break
+                        time.sleep(0.01)
+                if _player is None or _aq >= 12 or _wsq >= 25:
+                    _deadline += _round_interval
+                    _now = time.monotonic()
+                    if _deadline > _now:
+                        _left = _deadline - _now
+                        while not quit_event.is_set() and _left > 0:
+                            time.sleep(min(0.05, _left))
+                            _left = _deadline - time.monotonic()
+                    else:
+                        _deadline = _now
+                else:
+                    # 缓冲见底：本轮不睡，连续补产直到回到下限以上
+                    _deadline = time.monotonic()
+                continue
+
+            if _pacing_bounded:
+                # 有界队列 + 阻塞背压：维持在「音频 ~500ms、视频 ~400ms」的水位，
+                # 队列满了就让生产端等（绝不丢帧），发送端因此永远不会饿、也不会加速。
+                _player = getattr(self.output, "_player", None)
+                while not quit_event.is_set() and _player is not None:
+                    try:
+                        d = _player.queue_depths()
+                    except Exception:
+                        break
+                    if d.get("aq", 0) < 25 and d.get("vq", 0) < 10 and d.get("wsq", 0) < 50:
+                        break
+                    time.sleep(0.01)
+                continue
+
+            if _pacing_official:
+                # 官方 LiveTalking 模型：生产者尽量跑在前面，只按输出队列积压做背压。
+                # 队列里常驻 ≥5 帧（200ms）缓冲，RTP 发送端永远不会饿。
+                try:
+                    _bs = self.output.get_buffer_size()
+                except Exception:
+                    _bs = 0
+                if _bs >= 5:
+                    time.sleep(min(0.3, 0.04 * _bs * 0.8))
+                continue
 
             # 产出节拍：一轮 = batch_size 帧 = batch_size/fps 秒的视频（25fps、batch16 → 640ms）。
             # 必须按**时间**节流，而且**不能**按输出队列深度做背压：

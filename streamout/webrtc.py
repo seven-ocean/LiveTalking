@@ -28,9 +28,9 @@ class WebRTCOutput(BaseOutput):
         if self._player:
             self._player.push_video(frame)
 
-    def push_audio_frame(self, frame, eventpoint=None) -> None:
+    def push_audio_frame(self, frame, eventpoint=None, sample_rate=None) -> None:
         if self._player:
-            self._player.push_audio(frame, eventpoint)
+            self._player.push_audio(frame, eventpoint, sample_rate)
 
 
 

@@ -109,9 +109,9 @@ def parse_args():
     parser.add_argument(
         '--webrtc_log_level',
         type=str,
-        default='DEBUG',
+        default='INFO',
         choices=['DEBUG', 'INFO', 'WARNING', 'WARN', 'ERROR', 'CRITICAL'],
-        help="WebRTC 专用日志级别，默认 DEBUG",
+        help="WebRTC 专用日志级别，默认 INFO（DEBUG 会显著增加 I/O）",
     )
 
     # ─── 授权加固（批次 4）─────────────────────────────────────────────

@@ -55,7 +55,7 @@ class RTMPOutput(BaseOutput):
         sc.stream_profile = 'main'
         sc.audio_channel = 1
         
-        sc.sample_rate = 32000
+        sc.sample_rate = 44100
         
         sc.stream_server = self.push_url
 
@@ -95,7 +95,7 @@ class RTMPOutput(BaseOutput):
                 self.framecount = 0
                 self.totaltime=0
 
-    def push_audio_frame(self, frame, eventpoint=None) -> None:
+    def push_audio_frame(self, frame, eventpoint=None, sample_rate=None) -> None:
         if isinstance(frame, np.ndarray):
             # The upstream pipeline typically passes np.int16 (after multiplying by 32767).
             # The python_rtmpstream bindings expect np.float32 for AV_SAMPLE_FMT_FLTP.

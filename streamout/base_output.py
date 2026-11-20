@@ -37,7 +37,7 @@ class BaseOutput(ABC):
         ...
 
     @abstractmethod
-    def push_audio_frame(self, frame:NDArray[np.int16], eventpoint=None) -> None:
+    def push_audio_frame(self, frame:NDArray[np.int16], eventpoint=None, sample_rate=None) -> None:
         """推送音频帧"""
         ...
 

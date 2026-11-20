@@ -51,6 +51,7 @@ import registry
 from server.routes import setup_routes
 from server.rtc_manager import RTCManager
 from server.session_manager import session_manager
+from server.model_switch import ModelSwitchRequired  # [fix-publish-webrtc]:0693f81638
 
 import argparse
 import random
@@ -351,7 +352,8 @@ def get_or_load_avatar(avatar_id: str):
     """
     if _needs_model_switch(avatar_id):
         _write_switch_target(avatar_id)
-        os._exit(42)
+        # [fix-publish-webrtc]:f6e9ef8fda 请求线程里不能杀进程，交给 RTCManager 返回 503 后再退出
+        raise ModelSwitchRequired(avatar_id)
     cached = global_avatars.get(avatar_id)
     if cached is not None:
         _avatar_last_used[avatar_id] = time.time()
@@ -365,7 +367,8 @@ def get_or_load_avatar(avatar_id: str):
         # 避免 keep 模式下同时加载两套模型把显存顶爆。
         if _needs_model_switch(avatar_id):
             _write_switch_target(avatar_id)
-            os._exit(42)
+            # [fix-publish-webrtc]:026e07ad4d 同上：拿到锁后再判一次时也不能杀进程
+            raise ModelSwitchRequired(avatar_id)
         started = time.time()
         model_name = resolve_avatar_model(avatar_id)
         _update_avatar_state(avatar_id, status="loading", startedAt=started,
@@ -396,30 +399,97 @@ def _active_avatar_ids() -> set:
     return ids
 
 
-def _evict_avatars(keep: str = "") -> None:
-    """形象帧数据按 LRU 淘汰，保留最近用过的若干个。
+def _cgroup_mem_limit_mb() -> float:
+    """读取容器的内存上限（cgroup v1/v2），读不到返回 0。"""
+    for path in ("/sys/fs/cgroup/memory/memory.limit_in_bytes",
+                 "/sys/fs/cgroup/memory.max"):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = f.read().strip()
+            if raw in ("max", ""):
+                continue
+            value = int(raw)
+            if value > 0 and value < (1 << 60):
+                return value / 1048576.0
+        except Exception:
+            continue
+    return 0.0
 
-    淘汰的是内存里的形象帧（1080p 一套可达数百 MB），不是模型权重：权重在
-    _model_runtimes 里按模型共享，切换形象不会重复加载，显存也不会随形象数增长。
-    正在会话里用着的形象不淘汰。
+
+def _process_rss_mb() -> float:
+    """当前进程 RSS（MB）。"""
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return 0.0
+
+
+def _evict_avatars(keep: str = "") -> None:
+    """形象帧数据按 LRU 淘汰。
+
+    三层保护，避免“时间越久越卡”：
+      1) 数量上限 `ZL_AVATAR_CACHE_MAX`；
+      2) 内存护栏：RSS 超过 cgroup 上限的 `ZL_AVATAR_MEM_HIGH_PCT` 时只保留 1 套；
+      3) 空闲超时：无会话使用且空闲超过 `ZL_AVATAR_IDLE_EVICT_SECONDS` 的形象主动释放。
+    淘汰的是内存里的形象帧，不是模型权重；正在会话里用着的形象不淘汰。
     """
-    if _AVATAR_CACHE_MAX <= 0:
-        return
     active = _active_avatar_ids()
     dropped = []
-    while len(global_avatars) > _AVATAR_CACHE_MAX:
-        candidates = [aid for aid in global_avatars if aid not in active and aid != keep]
-        if not candidates:
-            break
-        victim = min(candidates, key=lambda aid: _avatar_last_used.get(aid) or 0.0)
-        global_avatars.pop(victim, None)
-        _avatar_last_used.pop(victim, None)
-        with _avatar_state_lock:
-            _avatar_state.pop(victim, None)
-        dropped.append(victim)
+    max_keep = _AVATAR_CACHE_MAX
+
+    # 2) 内存护栏
+    limit_mb = _cgroup_mem_limit_mb()
+    if limit_mb > 0:
+        try:
+            high_pct = float(os.environ.get("ZL_AVATAR_MEM_HIGH_PCT", "80")) / 100.0
+        except (TypeError, ValueError):
+            high_pct = 0.8
+        rss_mb = _process_rss_mb()
+        if rss_mb > limit_mb * high_pct and max_keep > 1:
+            max_keep = 1
+            logger.warning(
+                "形象缓存内存护栏触发：RSS %.0fMB / 上限 %.0fMB（%.0f%%），只保留 1 套形象",
+                rss_mb, limit_mb, rss_mb * 100.0 / limit_mb,
+            )
+
+    # 1) 数量上限
+    if max_keep > 0:
+        while len(global_avatars) > max_keep:
+            candidates = [aid for aid in global_avatars if aid not in active and aid != keep]
+            if not candidates:
+                break
+            victim = min(candidates, key=lambda aid: _avatar_last_used.get(aid) or 0.0)
+            global_avatars.pop(victim, None)
+            _avatar_last_used.pop(victim, None)
+            with _avatar_state_lock:
+                _avatar_state.pop(victim, None)
+            dropped.append(victim)
+
+    # 3) 空闲超时（默认 300s；0 表示不按空闲淘汰）
+    try:
+        idle_limit = float(os.environ.get("ZL_AVATAR_IDLE_EVICT_SECONDS", "300"))
+    except (TypeError, ValueError):
+        idle_limit = 300.0
+    if idle_limit > 0:
+        now = time.time()
+        for aid in list(global_avatars):
+            if aid in active or aid == keep:
+                continue
+            if now - (_avatar_last_used.get(aid) or 0.0) < idle_limit:
+                continue
+            global_avatars.pop(aid, None)
+            _avatar_last_used.pop(aid, None)
+            with _avatar_state_lock:
+                _avatar_state.pop(aid, None)
+            dropped.append(aid)
+
     if dropped:
         gc.collect()
-        logger.info("形象缓存超上限，已淘汰: %s", ", ".join(dropped))
+        logger.info("形象缓存已释放: %s（当前 %d 套）", ", ".join(dropped), len(global_avatars))
 
 
 def _safe_load_avatar(avatar_id: str):
@@ -495,11 +565,117 @@ def build_avatar_session(sessionid:str, params:dict)->BaseAvatar:
         logger.warning('fps=%s is not supported, zl-talking requires 25; keep 25', requested_fps)
     opt_this.fps = 25
 
+    # 弱客户端降载：low_perf / scale 参数降低本会话视频缩放，把 CPU 让给音频，
+    # 避免“一出现画面就电音”的老机器问题。默认沿用进程级 ZL_WEBRTC_SCALE。
+    try:
+        base_scale = float(os.environ.get("ZL_WEBRTC_SCALE", "0.75") or 0.75)
+    except (TypeError, ValueError):
+        base_scale = 0.75
+    opt_this.webrtc_scale = base_scale
+    low_perf = params.get('low_perf')
+    if isinstance(low_perf, str):
+        low_perf = low_perf.strip().lower() in ('1', 'true', 'yes', 'on')
+    if low_perf:
+        opt_this.webrtc_scale = min(base_scale, 0.65)
+    try:
+        req_scale = float(params.get('scale') or 0)
+        if 0.4 <= req_scale <= 1.0:
+            # URL 显式给 ?scale= 时以它为准（现场单机试档）
+            opt_this.webrtc_scale = req_scale
+    except (TypeError, ValueError):
+        pass
+
+    # 音频口径（能力中心「音频口径」）：auto = 生产 48k，WS 侧再按客户端设备率自适应；
+    # 显式 48000/44100/16000 时整条播放链按该口径生产（WebRTC 线上仍会被 Opus 转到 48k）。
+    raw_rate = params.get('audio_rate', params.get('audioRate'))
+    audio_profile = 'auto'
+    if raw_rate is not None and str(raw_rate).strip():
+        v = str(raw_rate).strip().lower()
+        if v in ('auto', '', '0'):
+            audio_profile = 'auto'
+        elif v in ('48000', '48000hz', '48k', '48000.0'):
+            audio_profile = 48000
+        elif v in ('44100', '44100hz', '44.1k', '44100.0'):
+            audio_profile = 44100
+        elif v in ('16000', '16000hz', '16k', '16000.0'):
+            audio_profile = 16000
+        else:
+            logger.warning('audio_rate=%s 不受支持，回落 auto', raw_rate)
+    try:
+        default_rate = int(os.environ.get('TALK_PLAYBACK_SR', '48000') or 48000)
+    except (TypeError, ValueError):
+        default_rate = 48000
+    opt_this.playback_rate = default_rate if audio_profile == 'auto' else int(audio_profile)
+    logger.info('[session] %s audio_rate=%s -> playback=%d', sessionid, audio_profile,
+                opt_this.playback_rate)
+
     # 按形象解析其真实模型，并用该模型的权重/loader 构建会话（支持单进程跨模型）
     model_name = resolve_avatar_model(avatar_id)
     rt = ensure_model_runtime(model_name)
     # 缓存优先，未缓存则冷加载（与 /warmup 共用同一去重逻辑）
     avatar_this = get_or_load_avatar(avatar_id)
+
+    # ── 直出：推理出什么画面就发什么画面（不做缩放/变速）─────────────────
+    # 2026-11-20 决策：砍掉「画质档位 + FPS 切换」。之前按档位把 540P 定成 20fps、
+    # 还把画面缩到 0.75，导致「生产 25fps / 传输 20fps」的队列溢出与口型错位。
+    # 现在：分辨率 = 推理帧原始尺寸（scale=1），帧率 = 推理原生 fps，码率取 env。
+    def _native_size(data):
+        try:
+            frames = None
+            if isinstance(data, (tuple, list)) and data:
+                frames = data[0]
+            elif isinstance(data, dict):
+                frames = data.get('frame_list') or data.get('frame_list_cycle')
+            else:
+                frames = getattr(data, 'frame_list_cycle', None)
+            if frames:
+                h, w = frames[0].shape[:2]
+                return int(w), int(h)
+        except Exception:
+            pass
+        return None
+
+    native = _native_size(avatar_this)
+    nw, nh = (native if native else (0, 0))
+    short = min(nw, nh) if native else 0
+    scale = 1.0
+    eff_short = short
+    try:
+        fps = int(getattr(opt, 'fps', 25) or 25)
+    except (TypeError, ValueError):
+        fps = 25
+    try:
+        max_bitrate = int(os.environ.get('ZL_WEBRTC_MAX_BITRATE', '8000000') or 8000000)
+    except (TypeError, ValueError):
+        max_bitrate = 8000000
+    try:
+        bitrate = int(os.environ.get('ZL_WEBRTC_BITRATE', '2000000') or 2000000)
+    except (TypeError, ValueError):
+        bitrate = 2000000
+    bitrate = max(500000, min(bitrate, max_bitrate))
+
+    opt_this.webrtc_scale = 1.0
+    opt_this.video_fps = fps
+    opt_this.video_bitrate = bitrate
+    opt_this.video_short_eff = int(eff_short)
+    opt_this.video_height_eff = int(eff_short)   # 兼容旧字段
+    if native:
+        logger.info('[session] %s 直出 video=%dx%d(short=%d) @%.1fMbps %dfps（不缩放/不降帧）',
+                    sessionid, nw, nh, short, bitrate / 1e6, fps)
+
+    # 产出节流模式（URL 试参，只影响本会话；默认 legacy = 原有行为）
+    _pacing = str(params.get('pacing') or '').strip().lower()
+    opt_this.pacing = _pacing if _pacing in ('legacy', 'official', 'bounded', 'sync25') else 'legacy'
+    # 发送码率上限（仅 ?bwcap= 显式指定时生效；默认不夹取，走 env 码率）
+    try:
+        _bwcap = int(float(params.get('bwcap') or 0))
+    except (TypeError, ValueError):
+        _bwcap = 0
+    opt_this.bwcap_kbps = _bwcap if _bwcap > 0 else 0
+    # 补齐节拍（重复上一帧）也属于"转换"，默认关闭且不再从 URL 开关
+    opt_this.frame_pace = False
+    logger.info('[session] %s 生效参数: video=%dx%d fps=%d scale=%.2f',
+                sessionid, nw, nh, opt_this.video_fps, opt_this.webrtc_scale)
 
     if ref_audio: #请求参数配置了参考音频
         opt_this.REF_FILE = ref_audio
@@ -512,9 +688,10 @@ def build_avatar_session(sessionid:str, params:dict)->BaseAvatar:
             logger.warning('invalid custom_config, ignored: %s', exc)
 
     logger.info(
-        '[session] %s params: avatar=%s, batch_size=%s, fps=%s, l/m/r=%s/%s/%s, refaudio=%s',
+        '[session] %s params: avatar=%s, batch_size=%s, fps=%s, l/m/r=%s/%s/%s, scale=%s, refaudio=%s',
         sessionid, avatar_id, opt_this.batch_size, opt_this.fps,
-        opt_this.l, opt_this.m, opt_this.r, opt_this.REF_FILE,
+        opt_this.l, opt_this.m, opt_this.r, opt_this.webrtc_scale,
+        opt_this.REF_FILE,
     )
 
     opt_this.model = model_name  # 会话记录真实模型（供 /admin 状态等使用）
@@ -688,6 +865,20 @@ def main():
     from config import parse_args
     opt = parse_args()
 
+    # 能力中心「输出方式」里的 ws/websocket 只表示客户端走 WS 降级通道，
+    # 服务端仍需要 webrtc 输出模块来产出帧/音频（WS 通道从 player 的槽位取帧）。
+    # 之前把 ws 直接传进 --transport，base_avatar 找不到输出模块 → process_frames
+    # 第一行 self.output.start() 就 AttributeError，整条音视频管线直接不工作。
+    # transport 三态：webrtc（直连）/ webrtc-fixed（固定端口，媒体仍走 TURN）/ ws。
+    # 服务端输出模块只认 webrtc，这里统一归一化。
+    _tr = str(getattr(opt, 'transport', '') or '').lower()
+    if _tr in ('webrtc-fixed', 'webrtc_fixed', 'webrtc-tcp', 'webrtc51000'):
+        logger.info('transport=%s（固定端口）按 webrtc 输出处理', opt.transport)
+        opt.transport = 'webrtc'
+    if str(getattr(opt, 'transport', '') or '').lower() in ('ws', 'websocket', 'ws-fallback'):
+        logger.info('transport=%s 是客户端降级方式，服务端输出按 webrtc 处理', opt.transport)
+        opt.transport = 'webrtc'
+
     # ─── 一机多卡负载均衡（GPU 网关模式入口）────────────────────────────
     # --gpu-ids 非空 → app.py 自身作为网关：为每张参与卡拉起一个 worker 子进程并转发信令。
     # --gpu-ids 留空   → 走下方原有单实例逻辑，行为与现状 100% 一致。
@@ -749,10 +940,11 @@ def main():
     # ICE 卡在 checking 时 pc 永不 failed → 「pc 失败即清理」不触发，浏览器异常退出
     # （标签页崩溃/断网/直接关掉）时 WS 断开路径也可能走不到，会话就会一直挂着占内存。
     # 这里每 30s 扫一遍：既无 WS 租约、又无活着 pc、且超时无活跃 → 销毁。
-    _REAP_INTERVAL = 30
-    # WS 模式断开不再立即销毁会话（避免每次重连都重新加载形象，约 11s）。
-    # 这里保留 5 分钟热会话，兼顾“下次测试秒回”和显存回收。
-    _REAP_IDLE_SECONDS = 300
+    _REAP_INTERVAL = int(os.environ.get("TALK_REAP_INTERVAL", "10"))
+    # 默认 10 秒回收空闲会话（TALK_REAP_IDLE_SECONDS 可调），避免掉线客户端长期占坑
+    _REAP_IDLE_SECONDS = int(os.environ.get("TALK_REAP_IDLE_SECONDS", "10"))
+    # 租约兜底：WS 客户端异常断开、finally 没跑到时，租约超过该时长且没有活跃 WS 消费 → 强制清理
+    _LEASE_TTL_SECONDS = int(os.environ.get("TALK_LEASE_TTL_SECONDS", "120"))
 
     async def _session_reaper():
         while True:
@@ -760,7 +952,16 @@ def main():
             try:
                 for sid in list(session_manager.sessions.keys()):
                     if session_manager.is_leased(sid):
-                        continue          # WS 降级通道还连着
+                        sess = session_manager.get_session(sid)
+                        player = getattr(getattr(sess, "output", None), "_player", None) if sess else None
+                        ws_active = bool(getattr(player, "ws_active", False)) if player else False
+                        if ws_active or session_manager.lease_age(sid) < _LEASE_TTL_SECONDS:
+                            continue          # WS 降级通道还连着
+                        logger.warning(
+                            "会话回收：WS 租约超时未释放，强制清理 sessionid=%s（租约 %.0fs）",
+                            sid, session_manager.lease_age(sid),
+                        )
+                        session_manager.force_release(sid)
                     try:
                         if rtc_manager.session_has_live_pc(sid):
                             continue      # WebRTC 还在用
@@ -789,6 +990,112 @@ def main():
     appasync.on_startup.append(_start_reaper)
     appasync.on_shutdown.append(_stop_reaper)
 
+    async def evict_idle_session(request):
+        """LB 满员时调用：回收一个会话。
+
+        默认只回收「无租约、无活 PC、空闲≥阈值」的会话；
+        `oldest=1` 时放宽为按 LRU 释放最旧会话（有用户排队时用，保证新用户能连入）。
+        """
+        aggressive = (request.query.get("oldest", "0").strip().lower()
+                      in ("1", "true", "yes", "on"))
+        try:
+            threshold = float(request.query.get("idle", os.environ.get("TALK_EVICT_IDLE_SECONDS", "10")))
+        except (TypeError, ValueError):
+            threshold = 10.0
+
+        def _free(sid):
+            try:
+                return (not session_manager.is_leased(sid)
+                        and not rtc_manager.session_has_live_pc(sid)
+                        and session_manager.idle_seconds(sid) >= threshold)
+            except Exception:
+                return False
+
+        mode = "oldest" if aggressive else "idle"
+        if aggressive:
+            # 先找真正空闲的；没有就按 LRU 释放最旧会话（新用户已在排队）
+            sid = (session_manager.evict_oldest(predicate=_free)
+                   or session_manager.evict_oldest())
+        else:
+            sid = session_manager.evict_oldest(predicate=_free)
+
+        if not sid:
+            return web.json_response({"code": 1, "msg": "no idle session"})
+        logger.info("evict_idle(%s): 回收会话 %s", mode, sid)
+        return web.json_response({"code": 0, "evicted": sid})
+
+    async def capacity_status(request):
+        """运维/安装脚本使用的容量快照；页面不调用、不展示数字。"""
+        data = rtc_manager.metrics()
+        return web.json_response({
+            "code": 0,
+            "data": {
+                "used": data.get("used", 0),
+                "max": data.get("max", 0),
+                "queue_evict": data.get("queue_evict"),
+                "reuse_on_offer": data.get("reuse_on_offer"),
+                "sessions": data.get("sessions", []),
+            },
+        })
+
+    async def metrics_status(request):
+        """性能与资源指标：会话、fps/队列/丢帧、RSS、线程数。"""
+        import threading
+        data = rtc_manager.metrics()
+        try:
+            with open("/proc/self/status", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        data["rss_kb"] = int(line.split()[1])
+                        break
+        except Exception:
+            pass
+        data["threads"] = threading.active_count()
+        return web.json_response(data)
+
+    async def ws_ping(request):
+        """WS 连通性测试端点：握手成功立即回 pong 并关闭，不建会话、不加载模型。"""
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        await ws.send_str("pong")
+        await ws.close()
+        return ws
+    appasync.router.add_get("/ws/ping", ws_ping)
+    appasync.router.add_post("/evict_idle", evict_idle_session)
+    appasync.router.add_get("/capacity", capacity_status)
+    async def avatar_size(request):
+        """素材原生分辨率：发布页据此禁用"素材达不到"的画质档位。
+
+        只从已加载缓存里读（不主动触发冷加载，避免页面被拖住）。
+        """
+        avatar_id = (request.query.get("avatar") or "").strip()
+        payload = global_avatars.get(avatar_id) if avatar_id else None
+        if payload is None:
+            return web.json_response({"code": 0, "data": {"cached": False}})
+        try:
+            frames = None
+            if isinstance(payload, (tuple, list)) and payload:
+                frames = payload[0]
+            elif isinstance(payload, dict):
+                frames = payload.get("frame_list") or payload.get("frame_list_cycle")
+            else:
+                frames = getattr(payload, "frame_list_cycle", None)
+            if not frames:
+                return web.json_response({"code": 0, "data": {"cached": False}})
+            h, w = frames[0].shape[:2]
+            w, h = int(w), int(h)
+            short = min(w, h)
+            max_tier = 540 if short < 720 else (720 if short < 1080 else 1080)
+            return web.json_response({"code": 0, "data": {
+                "cached": True, "width": w, "height": h, "short": short,
+                "max_short": max_tier,
+            }})
+        except Exception:
+            logger.exception("avatar_size failed")
+            return web.json_response({"code": 0, "data": {"cached": False}})
+
+    appasync.router.add_get("/metrics", metrics_status)
+    appasync.router.add_get("/avatar-size", avatar_size)
     appasync.router.add_post("/offer", offer)
     appasync.router.add_post("/flv/publish", flv_publish)
     appasync.router.add_post("/flv/ping", flv_ping)

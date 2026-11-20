@@ -11,9 +11,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 #         frames.append(frame)
 #     return frames
 
-def read_imgs(img_list):
+def read_imgs(img_list, grayscale=False):
+    flag = cv2.IMREAD_GRAYSCALE if grayscale else cv2.IMREAD_COLOR
+
     def load_image(index, img_path):
-        return index, cv2.imread(img_path)
+        return index, cv2.imread(img_path, flag)
 
     frames = [None] * len(img_list)  # Initialize a list with the same length as img_list
     with ThreadPoolExecutor() as executor:

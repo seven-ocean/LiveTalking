@@ -62,6 +62,88 @@ def _rewrite_sdp_public_ip(sdp: str) -> str:
     return sdp
 
 
+_SETUP_LINE_RE = re.compile(r"^a=setup:(\S+)\s*$")
+
+
+def _hoist_setup_to_session(sdp: str) -> str:
+    """把媒体级的 a=setup 提升到会话级。
+
+    RFC 4145 / JSEP 规定 a=setup 只能作为会话级属性；aiortc 的
+    MediaDescription.to_sdp() 会把它写进每个 m= 段。旧版 Chrome 容忍这种写法，
+    新版 Chrome/Edge 的 SDP 解析器会直接拒绝：
+      Failed to parse SessionDescription. a=setup:active Invalid SDP line.
+    这里统一提到 m= 之前（会话级），媒体段里的副本删除。
+    """
+    if "a=setup:" not in sdp:
+        return sdp
+    lines = sdp.splitlines()
+    media_setups = []
+    session_setup = None
+    in_media = False
+    out = []
+    for line in lines:
+        if line.startswith("m="):
+            in_media = True
+        m = _SETUP_LINE_RE.match(line)
+        if m:
+            if in_media:
+                media_setups.append(m.group(1))
+                continue
+            if session_setup is None:
+                session_setup = m.group(1)
+        out.append(line)
+    if not media_setups:
+        return sdp
+    if session_setup is None:
+        first_media = next((i for i, l in enumerate(out) if l.startswith("m=")), len(out))
+        t_index = next((i for i, l in enumerate(out[:first_media]) if l.startswith("t=")), None)
+        insert_at = (t_index + 1) if t_index is not None else first_media
+        out.insert(insert_at, f"a=setup:{media_setups[0]}")
+    if len(set(media_setups)) > 1:
+        webrtc_log.warning(
+            "SDP has mixed media-level a=setup %s, hoisted %s to session level",
+            sorted(set(media_setups)), media_setups[0],
+        )
+    return "\r\n".join(out) + "\r\n"
+
+
+_FINGERPRINT_RE = re.compile(r"^a=fingerprint:([A-Za-z0-9-]+)\s")
+
+
+def _keep_sha256_fingerprints(sdp: str) -> str:
+    """只保留 sha-256 的 a=fingerprint。
+
+    aiortc 会同时给 sha-256/sha-384/sha-512 三条；新版 Chrome 的 SDP 解析器
+    只接受 sha-256（现场报 `a=fingerprint:sha-512 ... Invalid SDP line`）。
+    DTLS 校验用同一张证书，保留 sha-256 足够。
+    """
+    if "a=fingerprint:" not in sdp:
+        return sdp
+    lines = sdp.splitlines()
+    has_sha256 = any(
+        (m := _FINGERPRINT_RE.match(line)) and m.group(1).lower() == "sha-256"
+        for line in lines
+    )
+    if not has_sha256:
+        return sdp
+    out = []
+    dropped = 0
+    for line in lines:
+        m = _FINGERPRINT_RE.match(line)
+        if m and m.group(1).lower() != "sha-256":
+            dropped += 1
+            continue
+        out.append(line)
+    if dropped:
+        webrtc_log.info("SDP: dropped %d non-sha256 fingerprint line(s) for Chrome parser", dropped)
+    return "\r\n".join(out) + "\r\n"
+
+
+def _normalize_answer_sdp(sdp: str) -> str:
+    """把 aiortc 生成的 answer 归一成新版 Chrome 能解析的形式。"""
+    return _keep_sha256_fingerprints(_hoist_setup_to_session(sdp))
+
+
 async def _wait_ice_gathering(pc, timeout: float = 3.0) -> None:
     """等 aiortc 收集完 ICE 候选再返回 answer，避免 SDP 里没有 candidate。"""
     if pc.iceGatheringState == "complete":
@@ -90,6 +172,153 @@ async def _wait_ice_gathering(pc, timeout: float = 3.0) -> None:
 
 
 from server.session_manager import session_manager
+from server.model_switch import ModelSwitchRequired  # [fix-publish-webrtc]:0693f81638
+
+
+def _force_target_bitrate(enc, bps: int) -> bool:
+    """绕过 aiortc 的 [MIN,MAX] 夹取，直接把编码器目标码率钉在 bps。
+
+    aiortc 的 target_bitrate setter 会把值夹到 MIN_BITRATE（本项目默认 4M），
+    浏览器 REMB 又能把它顶到 MAX_BITRATE（12M）—— 于是 540P@25 的数字人实际
+    跑在 10Mbps 上下。单端口 TURN/TCP 通道扛不住这种突发（TCP 队头阻塞），
+    表现就是音频和视频**同时**卡住几百毫秒到数秒（客户端 conceal 与 freeze 同步上涨）。
+    """
+    if enc is None:
+        return False
+    attr = '_%s__target_bitrate' % type(enc).__name__
+    if not hasattr(enc, attr):
+        return False
+    try:
+        setattr(enc, attr, int(bps))
+        return True
+    except Exception:
+        return False
+
+
+async def _enforce_bitrate_cap(player, pc, cap_bps: int) -> None:
+    """把发送码率压在 cap_bps 以内——只在编码器首次就绪时设一次。
+
+    ⚠ 不要周期性重设：aiortc 的 H264Encoder 在 target 与 codec.bit_rate 相差
+    >10% 时会**重建编码器**（新 IDR）。REMB 每秒把它写回 4~12M，我们再压回 1.2M，
+    就会造成每秒级的关键帧风暴（实测每个 2s 采样收到 6~14 个关键帧），
+    带宽/抖动反而更差。
+    """
+    sender = getattr(player, 'video_sender', None)
+    if not sender or cap_bps <= 0:
+        return
+    for _ in range(200):          # 最多等 10s
+        enc = getattr(sender, '_RTCRtpSender__encoder', None)
+        if enc is not None:
+            _force_target_bitrate(enc, cap_bps)
+            _wrap_encode_timing(player, enc)
+            return
+        await asyncio.sleep(0.05)
+
+
+def _wrap_encode_timing(player, enc) -> None:
+    """[诊断] 记录每帧 H.264 编码耗时（判断发送端是否被编码拖成「成串发送」）。"""
+    if getattr(enc, '_zl_timed', False):
+        return
+    orig = getattr(enc, 'encode', None)
+    if orig is None:
+        return
+
+    def encode(frame, force_keyframe=False):
+        t0 = time.perf_counter()
+        try:
+            return orig(frame, force_keyframe)
+        finally:
+            d = (time.perf_counter() - t0) * 1000.0
+            player._enc_n = getattr(player, '_enc_n', 0) + 1
+            player._enc_sum = getattr(player, '_enc_sum', 0.0) + d
+            if d > getattr(player, '_enc_max', 0.0):
+                player._enc_max = d
+
+    enc.encode = encode
+    enc._zl_timed = True
+
+
+async def _apply_video_bitrate(player) -> None:
+    """把会话画质档位的码率下发给 H264 编码器（编码器在第一帧才创建）。"""
+    bitrate = int(getattr(player, 'video_bitrate', 0) or 0)
+    sender = getattr(player, 'video_sender', None)
+    if not sender or bitrate <= 0:
+        return
+    for _ in range(200):          # 最多等 10s
+        enc = getattr(sender, '_RTCRtpSender__encoder', None)
+        if enc is not None and hasattr(enc, 'target_bitrate'):
+            try:
+                enc.target_bitrate = bitrate
+                logger.info('[webrtc] video target_bitrate -> %d bps', bitrate)
+            except Exception:
+                pass
+            return
+        await asyncio.sleep(0.05)
+
+
+async def _sender_stats_loop(player, pc) -> None:
+    """每 5s 采样一次发送侧码率，写进 [perf] 日志（判断是码率给低还是带宽到顶）。"""
+    sender = getattr(player, 'video_sender', None)
+    if not sender:
+        return
+    last_bytes = 0
+    last_t = time.monotonic()
+    while True:
+        await asyncio.sleep(5)
+        try:
+            if pc.connectionState in ('closed', 'failed'):
+                return
+            st = await sender.getStats()
+            # aiortc 的 getStats() 返回**列表**（原来按对象取 bytesSent 恒为 0 → vbps 一直 0）
+            if isinstance(st, (list, tuple)):
+                total = sum(int(getattr(x, 'bytesSent', 0) or 0) for x in st)
+            else:
+                total = int(getattr(st, 'bytesSent', 0) or 0)
+            now = time.monotonic()
+            player.vbps = (total - last_bytes) * 8 / max(0.1, now - last_t)
+            last_bytes, last_t = total, now
+            enc = getattr(sender, '_RTCRtpSender__encoder', None)
+            player.vtb = int(getattr(enc, 'target_bitrate', 0) or 0) if enc is not None else 0
+        except Exception:
+            continue
+
+
+def _requested_fps(params) -> int:
+    """URL ?video_fps=24 → 24；未指定返回 0（不参与比对）。"""
+    for key in ("video_fps", "videoFps"):
+        try:
+            v = params.get(key)
+            if v:
+                n = int(float(v))
+                return n if 1 <= n <= 25 else 0
+        except (TypeError, ValueError, AttributeError):
+            pass
+    return 0
+
+
+def _requested_short(params) -> int:
+    """从 offer 参数里取客户端要的**短边**（0 = 未指定/原画，由服务端按素材决定）。"""
+    for key in ("video_short", "video_short_side", "video_height", "videoHeight"):
+        try:
+            v = params.get(key)
+            if v:
+                return int(float(v))
+        except (TypeError, ValueError, AttributeError):
+            pass
+    q = str(params.get("video_quality") or params.get("videoQuality") or "").strip().lower()
+    return {"540p": 540, "720p": 720, "1080p": 1080}.get(q, 0)
+
+
+def _webrtc_video_enabled() -> bool:
+    """WebRTC 是否发送视频轨。
+
+    ZL_WEBRTC_VIDEO=0 或存在 ../runtime/conf/webrtc-video.off 时只发音频。
+    后者是**热开关**：建会话时现读，不需要重启，用来验证「TCP 上视频把音频顶住」。
+    """
+    if os.environ.get("ZL_WEBRTC_VIDEO", "1").strip().lower() in ("0", "false", "no", "off"):
+        return False
+    flag = os.path.abspath(os.path.join(os.getcwd(), "..", "runtime", "conf", "webrtc-video.off"))
+    return not os.path.exists(flag)
 
 
 class RTCManager:
@@ -175,29 +404,131 @@ class RTCManager:
 
         return servers
 
+    def _max_sessions(self) -> int:
+        """单进程会话上限；多卡模式由 gpu_lb 按每卡上限控制，worker 侧仍生效。"""
+        try:
+            return max(1, int(os.environ.get(
+                "TALK_MAX_SESSIONS", getattr(self.opt, "max_session", 2) or 2)))
+        except (TypeError, ValueError):
+            return 2
+
+    def _has_capacity(self, exclude_sid: str = "") -> bool:
+        """判断能否再建新会话；满员时按 LRU 释放一个最旧会话。
+
+        两级策略：优先释放「无活 PC、无 WS 租用」的会话；没有才动最旧的活跃会话。
+        默认允许“来一个排队就踢最旧”，TALK_QUEUE_EVICT=0 可关闭。
+        """
+        limit = self._max_sessions()
+        if len(session_manager.sessions) < limit:
+            return True
+        if os.environ.get("TALK_QUEUE_EVICT", "1").strip().lower() in ("0", "false", "no", "off"):
+            return False
+
+        def _free(sid):
+            try:
+                return (not session_manager.is_leased(sid)
+                        and not self.session_has_live_pc(sid))
+            except Exception:
+                return False
+
+        def _not_leased(sid):
+            try:
+                return not session_manager.is_leased(sid)
+            except Exception:
+                return False
+
+        evicted = (session_manager.evict_oldest(exclude=exclude_sid, predicate=_free)
+                   or session_manager.evict_oldest(exclude=exclude_sid, predicate=_not_leased)
+                   or session_manager.evict_oldest(exclude=exclude_sid))
+        if evicted:
+            logger.info("[capacity] 满员（上限 %d），已释放最旧会话 sessionid=%s", limit, evicted)
+        return len(session_manager.sessions) < limit
+
+    def _capacity_response(self) -> web.Response:
+        used = len([s for s in session_manager.sessions.values() if s is not None])
+        limit = self._max_sessions()
+        # 数值只进日志/运维指标，不返回给最终用户
+        logger.warning("[capacity] 线路已满（%d/%d），拒绝新会话", used, limit)
+        return web.Response(
+            status=503,
+            content_type="application/json",
+            text=json.dumps({
+                "code": 503,
+                "msg": "当前线路资源紧张，正在为您排队，请稍候…",
+                "queue": True,
+            }),
+        )
+
     async def _do_handle_offer(self, request):
         """实际处理 WebRTC offer 信令（内部方法，便于外层加超时）。"""
         params = await request.json()
-        offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
 
-        if False: # 不再由 RTCManager 控制 max_session，让业务逻辑或SessionManager 控制
-            logger.info('reach max session')
+        # 页面关闭/切走时的显式释放：复用 /offer 通道，不要求 SDP，不改 Java relay。
+        if params.get("release"):
+            sid = (params.get("sessionid") or "").strip()
+            if sid:
+                session_manager.stop_session(sid)
+                session_manager.remove_session(sid)
+                logger.info("[capacity] 显式释放会话 sessionid=%s", sid)
             return web.Response(
                 content_type="application/json",
-                text=json.dumps({"code": -1, "msg": "reach max session"}),
+                text=json.dumps({"code": 0, "released": sid}),
             )
+
+        offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
 
         # ── 阶段 1：复用或创建会话（含形象冷加载，可能远超 30s）——独立超时 ──
         # 页面在 ICE 失败后经常连续重试 offer。每次新建会话会多一套渲染/推理线程，
-        # 旧会话还要保留 5 分钟，越用越卡。这里在单会话场景下优先复用「没有活跃
-        # WebRTC 连接、没有被 WS 租用、且形象相同」的会话。
+        # 旧会话还要保留一段时间，越用越卡。这里优先复用「没有活跃 WebRTC 连接、
+        # 没有被 WS 租用、且形象相同」的会话；默认开启，可用 REUSE_SESSION_ON_OFFER=0 关闭。
         session_timeout = getattr(self.opt, 'session_timeout', 120.0)
         sessionid = ''
         params_sid = (params.get('sessionid') or '').strip() if isinstance(params, dict) else ''
+
+        def _session_matches(sess_opt) -> bool:
+            """本会话的档位/帧率/节流模式是否与本次 offer 一致。
+
+            不一致必须重建：预热（/warmup）创建的会话不带这些参数，
+            前端重连又常带 sessionid 回来，若不比对就会一直套用 fps=20 的旧会话，
+            URL 上的 pacing/bwcap 永远不生效。
+            """
+            if _requested_short(params) != int(getattr(sess_opt, 'video_short_eff', 0) or 0):
+                return False
+            _wf = _requested_fps(params)
+            if _wf and _wf != int(getattr(sess_opt, 'video_fps', 0) or 0):
+                return False
+            _wp = str(params.get('pacing') or '').strip().lower()
+            if _wp not in ('legacy', 'official', 'bounded', 'sync25'):
+                _wp = 'legacy'
+            if _wp != str(getattr(sess_opt, 'pacing', 'legacy') or 'legacy').lower():
+                return False
+            _wpc = str(params.get('frame_pace') or '').strip().lower() in ('fill', '1', 'true', 'on')
+            if _wpc != bool(getattr(sess_opt, 'frame_pace', False)):
+                return False
+            return True
+
+        # 只有 URL 显式带 pacing（试参）时才严格比对会话参数；默认路径保持原有行为。
+        _explicit_pacing = str(params.get('pacing') or '').strip().lower() in (
+            'legacy', 'official', 'bounded', 'sync25')
         if (params_sid and session_manager.has_session(params_sid)
                 and not session_manager.is_leased(params_sid)):
-            sessionid = params_sid
-        elif os.environ.get('REUSE_SESSION_ON_OFFER', '0').strip().lower() in ('1', 'true', 'yes', 'on'):
+            _so = getattr(session_manager.get_session(params_sid), 'opt', None)
+            if (not _explicit_pacing) or _session_matches(_so):
+                sessionid = params_sid
+            else:
+                logger.info("[session] 请求参数与会话不符（pacing=%s fps=%s -> pacing=%s fps=%s），重建会话 sessionid=%s",
+                            getattr(_so, 'pacing', ''), getattr(_so, 'video_fps', 0),
+                            str(params.get('pacing') or 'legacy').strip().lower(),
+                            _requested_fps(params), params_sid)
+                # 线路容量有限（现场 1/1）：旧会话不先释放，新会话会被「线路已满」拒掉，
+                # 前端于是又退回旧会话（fps=20 / legacy），参数永远不生效。
+                try:
+                    if not self.session_has_live_pc(params_sid, require_connected=True):
+                        session_manager.remove_session(params_sid)
+                        logger.info("[session] 已释放旧会话（参数不符）sessionid=%s", params_sid)
+                except Exception:
+                    pass
+        elif os.environ.get('REUSE_SESSION_ON_OFFER', '1').strip().lower() in ('1', 'true', 'yes', 'on'):
             want_avatar = params.get('avatar') or getattr(self.opt, 'avatar_id', None)
             for sid in reversed(list(session_manager.sessions.keys())):
                 if not session_manager.has_session(sid):
@@ -209,7 +540,33 @@ class RTCManager:
                 if self.session_has_live_pc(sid, require_connected=True):
                     continue
                 sess = session_manager.get_session(sid)
-                if getattr(getattr(sess, 'opt', None), 'avatar_id', None) != want_avatar:
+                sess_opt = getattr(sess, 'opt', None)
+                if getattr(sess_opt, 'avatar_id', None) != want_avatar:
+                    continue
+                # 画质档位（目标高度）变了：不能复用旧会话，否则切档后要等回收才生效
+                if _requested_short(params) != int(getattr(sess_opt, 'video_short_eff', 0) or 0):
+                    logger.info("[quality] 画质档位变化（%s -> %s），重建会话 sessionid=%s",
+                                getattr(sess_opt, 'video_short_eff', 0),
+                                _requested_short(params), sid)
+                    continue
+                # 帧率 / 补齐节拍 也要参与比对：否则改 URL 参数后复用旧会话，新参数不生效
+                _want_fps = _requested_fps(params)
+                if _want_fps and _want_fps != int(getattr(sess_opt, 'video_fps', 0) or 0):
+                    logger.info("[quality] 帧率变化（%s -> %s），重建会话 sessionid=%s",
+                                getattr(sess_opt, 'video_fps', 0), _want_fps, sid)
+                    continue
+                # 节流模式变化也要重建会话（否则改 URL 后复用旧会话，新参数不生效）
+                _want_pacing = str(params.get('pacing') or '').strip().lower()
+                if _want_pacing not in ('legacy', 'official', 'bounded', 'sync25'):
+                    _want_pacing = 'legacy'
+                if _want_pacing != str(getattr(sess_opt, 'pacing', 'legacy') or 'legacy').lower():
+                    logger.info("[pacing] 节流模式变化（%s -> %s），重建会话 sessionid=%s",
+                                getattr(sess_opt, 'pacing', 'legacy'), _want_pacing, sid)
+                    continue
+                _want_pace = str(params.get('frame_pace') or '').strip().lower() in ('fill', '1', 'true', 'on')
+                if _want_pace != bool(getattr(sess_opt, 'frame_pace', False)):
+                    logger.info("[quality] 补齐节拍变化（%s -> %s），重建会话 sessionid=%s",
+                                getattr(sess_opt, 'frame_pace', False), _want_pace, sid)
                     continue
                 sessionid = sid
                 break
@@ -226,6 +583,19 @@ class RTCManager:
             )
             avatar_session = session_manager.get_session(sessionid)
         else:
+            # 容量控制：满员时按 LRU 释放最旧会话再接收；仍满则短暂排队等待，
+            # 避免“别的会话正在加载（占位 None）”时把新用户直接拒掉。
+            if not self._has_capacity(exclude_sid=params_sid):
+                try:
+                    wait_s = float(os.environ.get("TALK_QUEUE_WAIT_SECONDS", "15"))
+                except (TypeError, ValueError):
+                    wait_s = 15.0
+                waited = 0.0
+                while waited < wait_s and not self._has_capacity(exclude_sid=params_sid):
+                    await asyncio.sleep(0.5)
+                    waited += 0.5
+                if not self._has_capacity(exclude_sid=params_sid):
+                    return self._capacity_response()
             sessionid = await asyncio.wait_for(
                 session_manager.create_session(params),
                 timeout=session_timeout,
@@ -340,7 +710,28 @@ class RTCManager:
             from server.webrtc import HumanPlayer
             player = HumanPlayer(avatar_session)
             pc.addTrack(player.audio)
-            pc.addTrack(player.video)
+            # 音频优先诊断/降载开关：ZL_WEBRTC_VIDEO=0 时不发视频轨，
+            # 用来验证「TCP 上视频把音频顶住」这类 HOL 阻塞问题。
+            if _webrtc_video_enabled():
+                video_sender = pc.addTrack(player.video)
+                player.video_sender = video_sender
+                try:
+                    player.video_bitrate = int(
+                        getattr(avatar_session.opt, 'video_bitrate', 0) or 0)
+                except Exception:
+                    player.video_bitrate = 0
+                asyncio.create_task(_apply_video_bitrate(player))
+                asyncio.create_task(_sender_stats_loop(player, pc))
+                # URL ?bwcap=1200（kbps）或 sync25 会话：把发送码率钉在档位值以内。
+                # 不钉的话 REMB 会把它顶到 12M，单端口 TURN/TCP 上音视频会一起卡。
+                try:
+                    _cap = int(getattr(avatar_session.opt, 'bwcap_kbps', 0) or 0) * 1000
+                except Exception:
+                    _cap = 0
+                if _cap > 0:
+                    logger.info('[webrtc] bitrate cap -> %d bps (session %s)',
+                                _cap, sessionid)
+                    asyncio.create_task(_enforce_bitrate_cap(player, pc, _cap))
 
             # 设置编解码器偏好
             capabilities = RTCRtpSender.getCapabilities("video")
@@ -379,6 +770,9 @@ class RTCManager:
         webrtc_log.info("local description set", extra={"sessionid": sessionid})
 
         sdp = _rewrite_sdp_public_ip(pc.localDescription.sdp)
+        sdp = _normalize_answer_sdp(sdp)
+        if not sdp or "v=0" not in sdp:
+            raise RuntimeError("answer SDP is empty")  # [fix-publish-webrtc]:04c5862d2e
         if "a=candidate:" not in sdp:
             webrtc_log.warning(
                 "answer SDP has no ICE candidate, browser cannot connect",
@@ -411,6 +805,24 @@ class RTCManager:
         """
         try:
             return await self._do_handle_offer(request)
+        except ModelSwitchRequired as e:
+            # [fix-publish-webrtc]:bc7f213ba3 先回 503，再按原逻辑重启，避免 relay 拿到空 answer
+            logger.warning(
+                "handle_offer requires model switch: avatar=%s; restart after response",
+                e.avatar_id,
+            )
+            try:
+                asyncio.get_running_loop().call_later(0.5, os._exit, 42)
+            except RuntimeError:
+                pass
+            return web.Response(
+                status=503,
+                content_type="application/json",
+                text=json.dumps({
+                    "code": 503,
+                    "msg": f"model switching to {e.avatar_id}, please retry",
+                }),
+            )
         except asyncio.TimeoutError as e:
             logger.exception("handle_offer timeout: %s", e)
             return web.Response(
@@ -454,7 +866,8 @@ class RTCManager:
         from server.webrtc import HumanPlayer
         player = HumanPlayer(avatar_session)
         pc.addTrack(player.audio)
-        pc.addTrack(player.video)
+        if _webrtc_video_enabled():
+            pc.addTrack(player.video)
 
         await pc.setLocalDescription(await pc.createOffer())
 
@@ -599,6 +1012,31 @@ class RTCManager:
                 await self.stop_flv_publish(sid)
             except Exception:
                 logger.exception("[flv] 自动停止失败 sessionid=%s", sid)
+
+    def metrics(self) -> dict:
+        """运行指标：会话、PC、每会话播放器计数（/metrics 使用）。"""
+        sessions = []
+        for item in session_manager.stats():
+            sid = item.get("sessionid")
+            sess = session_manager.get_session(sid)
+            player = None
+            try:
+                player = getattr(getattr(sess, "output", None), "_player", None)
+            except Exception:
+                pass
+            item = dict(item)
+            item["has_pc"] = self.session_has_live_pc(sid)
+            if player is not None and hasattr(player, "stats"):
+                item["player"] = player.stats()
+            sessions.append(item)
+        return {
+            "used": session_manager.active_count(),
+            "max": self._max_sessions(),
+            "sessions": sessions,
+            "pcs": len(self.pcs),
+            "queue_evict": os.environ.get("TALK_QUEUE_EVICT", "1"),
+            "reuse_on_offer": os.environ.get("REUSE_SESSION_ON_OFFER", "1"),
+        }
 
     async def shutdown(self):
         """关闭全部 PeerConnection"""
