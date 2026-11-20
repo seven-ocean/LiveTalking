@@ -726,11 +726,27 @@ class BaseAvatar:
         _pacing_official = (getattr(self, 'pacing_mode', 'legacy') == 'official')
         _pacing_bounded = (getattr(self, 'pacing_mode', 'legacy') == 'bounded')
         _pacing_sync25 = (getattr(self, 'pacing_mode', 'legacy') == 'sync25')
+        _pacing_runway = (getattr(self, 'pacing_mode', 'legacy') == 'runway')
         while not quit_event.is_set():
             t = time.perf_counter()
             self.asr.run_step()
             if quit_event.is_set():
                 break
+
+            if _pacing_runway:
+                # runway：允许跑在前面（不按 25fps 硬节拍自我限速），只在
+                # 视频队列攒到 40 帧 / 音频 100 帧时停等。这样推理慢一拍时
+                # 播放端仍有几秒盈余；真断供时由 frame_pace 重复上一帧兜底。
+                _player = getattr(self.output, "_player", None)
+                while not quit_event.is_set() and _player is not None:
+                    try:
+                        _d = _player.queue_depths()
+                    except Exception:
+                        break
+                    if int(_d.get("vq", 0) or 0) < 40 and int(_d.get("aq", 0) or 0) < 100:
+                        break
+                    time.sleep(0.01)
+                continue
 
             if _pacing_sync25:
                 # sync25：视频轨与推理同频（25fps），音频水位维持在 0.24~0.5s：

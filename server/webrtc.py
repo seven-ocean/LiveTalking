@@ -82,7 +82,10 @@ class PlayerStreamTrack(MediaStreamTrack):
             _pm = ''
         # 默认（legacy/official）保持原值 24；sync25 用 20（同频后无需更大）。
         if kind == 'video':
-            _vmax = 20 if _pm == 'sync25' else 24
+            if _pm == 'runway':
+                _vmax = 64          # 全画幅一帧约 2.7MB，64 帧 ≈ 173MB/会话
+            else:
+                _vmax = 20 if _pm == 'sync25' else 24
         else:
             _vmax = 30 if _pm == 'sync25' else 100
         self._queue = queue.Queue(maxsize=_vmax)
@@ -643,7 +646,7 @@ class HumanPlayer:
         # WS-only 场景直接不入这条队。
         if self._webrtc_video_active:
             try:
-                if getattr(self, 'pacing_mode', 'legacy') in ('bounded', 'sync25'):
+                if getattr(self, 'pacing_mode', 'legacy') in ('bounded', 'sync25', 'runway'):
                     # 有界队列 + 阻塞背压：宁可让生产端等，也不要在音频时间轴上留洞
                     #（sync25 首句 TTS 会一次性灌入数秒音频，非阻塞写法会把**开头**丢掉）
                     self.__audio._queue.put((new_frame, eventpoint, seq), timeout=0.05)

@@ -665,15 +665,15 @@ def build_avatar_session(sessionid:str, params:dict)->BaseAvatar:
 
     # 产出节流模式（URL 试参，只影响本会话；默认 legacy = 原有行为）
     _pacing = str(params.get('pacing') or '').strip().lower()
-    opt_this.pacing = _pacing if _pacing in ('legacy', 'official', 'bounded', 'sync25') else 'legacy'
+    opt_this.pacing = _pacing if _pacing in ('legacy', 'official', 'bounded', 'sync25', 'runway') else 'legacy'
     # 发送码率上限（仅 ?bwcap= 显式指定时生效；默认不夹取，走 env 码率）
     try:
         _bwcap = int(float(params.get('bwcap') or 0))
     except (TypeError, ValueError):
         _bwcap = 0
     opt_this.bwcap_kbps = _bwcap if _bwcap > 0 else 0
-    # 补齐节拍（重复上一帧）也属于"转换"，默认关闭且不再从 URL 开关
-    opt_this.frame_pace = False
+    # 补齐节拍（重复上一帧）：runway 分支用它把"等帧"变成"补帧"，画面不冻结
+    opt_this.frame_pace = (opt_this.pacing == 'runway')
     logger.info('[session] %s 生效参数: video=%dx%d fps=%d scale=%.2f',
                 sessionid, nw, nh, opt_this.video_fps, opt_this.webrtc_scale)
 

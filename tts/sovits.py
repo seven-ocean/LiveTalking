@@ -1,3 +1,6 @@
+import os
+import queue
+import threading
 import time
 import numpy as np
 import resampy
@@ -13,6 +16,92 @@ from registry import register
 
 @register("tts", "gpt-sovits")
 class SovitsTTS(BaseTTS):
+
+    # ── 持久流式会话（TTS_SESSION_MODE=1 启用；默认走原有逐段请求）──────
+    def render(self, quit_event):
+        # 注意：BaseTTS.render 是"起线程后立刻返回"——avatar 的 render() 在它之后
+        # 才会启动推理/渲染线程。这里必须保持同样的语义，否则会把整条视频管线卡住。
+        if os.environ.get('TTS_SESSION_MODE', '0').strip() != '1':
+            return super().render(quit_event)
+        try:
+            from .sovits_session import SovitsSession
+        except Exception:
+            logger.exception('[tts-session] import failed, fallback to legacy')
+            return super().render(quit_event)
+        threading.Thread(target=self._session_loop, args=(quit_event, SovitsSession),
+                         name='tts-session', daemon=True).start()
+
+    def _session_loop(self, quit_event, SovitsSession):
+        logger.info('[tts-session] mode=enabled（一条连接连续出音频）')
+        sess = None
+        max_idle = float(os.environ.get('TTS_SESSION_MAX_IDLE', '120') or 120)
+        try:
+            while not quit_event.is_set():
+                try:
+                    msg = self.msgqueue.get(block=True, timeout=0.2)
+                except queue.Empty:
+                    # 会话常驻：TTS 暂时间隔（LLM 思考/换句）不关闭连接，
+                    # 否则每停一次就要付一次首包延迟，接缝又回来了。
+                    # 只在超过 TTS_SESSION_MAX_IDLE（默认 120s）无文本时回收。
+                    if sess is not None and sess.idle_seconds() > max_idle:
+                        sess.finish()
+                        sess = None
+                    continue
+                text, textevent = msg
+                if not str(text or '').strip():
+                    continue
+                tts_options = (textevent or {}).get('tts', {}) or {}
+                if sess is None or not getattr(sess, '_alive', False):
+                    sess = self._open_session(SovitsSession, tts_options)
+                if sess is not None and not sess.send(text):
+                    # 连接可能被服务端回收：重连后重发一次，再不行才退回旧路径
+                    try:
+                        sess.close()
+                    except Exception:
+                        pass
+                    sess = self._open_session(SovitsSession, tts_options)
+                    if sess is not None:
+                        sess.send(text)
+                if sess is None:
+                    # 会话不可用：这一条退回旧的逐段请求，保证不断音
+                    try:
+                        self.txt_to_audio(msg)
+                    except Exception:
+                        logger.exception('[tts-session] legacy fallback failed')
+        finally:
+            if sess is not None:
+                sess.finish()
+            try:
+                self.stop_tts()
+            except Exception:
+                pass
+        logger.info('[tts-session] thread stop')
+
+    def _open_session(self, cls, tts_options: dict):
+        server = str(getattr(self.opt, 'TTS_SERVER', '') or '')
+        if not server:
+            return None
+        url = server.replace('https://', 'wss://').replace('http://', 'ws://').rstrip('/') + '/tts/ws'
+        ref_file = (tts_options.get('ref_audio_path') or tts_options.get('ref_file')
+                    or self.opt.REF_FILE)
+        ref_text = (tts_options.get('prompt_text') or tts_options.get('ref_text')
+                    or self.opt.REF_TEXT)
+        text_lang = tts_options.get('text_lang') or 'zh'
+        query = {
+            'text_lang': text_lang,
+            'prompt_lang': tts_options.get('prompt_lang') or text_lang,
+            'ref_audio_path': ref_file or '',
+            'prompt_text': ref_text or '',
+        }
+        for k in ('batch_size', 'fragment_interval', 'text_split_method', 'speed_factor',
+                  'seed', 'repetition_penalty'):
+            if tts_options.get(k) is not None:
+                query[k] = tts_options[k]
+        session = cls(self, url, query)
+        if not session.open():
+            return None
+        return session
+
     def txt_to_audio(self,msg:tuple[str, dict]): 
         text,textevent = msg
         tts_options = textevent.get('tts', {}) or {}

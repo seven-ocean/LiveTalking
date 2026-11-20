@@ -498,7 +498,7 @@ class RTCManager:
             if _wf and _wf != int(getattr(sess_opt, 'video_fps', 0) or 0):
                 return False
             _wp = str(params.get('pacing') or '').strip().lower()
-            if _wp not in ('legacy', 'official', 'bounded', 'sync25'):
+            if _wp not in ('legacy', 'official', 'bounded', 'sync25', 'runway'):
                 _wp = 'legacy'
             if _wp != str(getattr(sess_opt, 'pacing', 'legacy') or 'legacy').lower():
                 return False
@@ -557,7 +557,7 @@ class RTCManager:
                     continue
                 # 节流模式变化也要重建会话（否则改 URL 后复用旧会话，新参数不生效）
                 _want_pacing = str(params.get('pacing') or '').strip().lower()
-                if _want_pacing not in ('legacy', 'official', 'bounded', 'sync25'):
+                if _want_pacing not in ('legacy', 'official', 'bounded', 'sync25', 'runway'):
                     _want_pacing = 'legacy'
                 if _want_pacing != str(getattr(sess_opt, 'pacing', 'legacy') or 'legacy').lower():
                     logger.info("[pacing] 节流模式变化（%s -> %s），重建会话 sessionid=%s",
