@@ -50,10 +50,10 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-# 默认走 H.264（独立 x264 进程 + 客户端 WebCodecs 硬解），尺度 0.75 = 540x960；
-# 不支持 WebCodecs 的浏览器回落 JPEG（以下参数用于该兜底路径）。
+# 默认走 H.264（独立 x264 进程 + 客户端 WebCodecs 硬解）。
+# 2026-11-21 起推理直出，WS 也不再做 0.75 缩放（对齐 WebRTC 的 720x1280）。
 JPEG_QUALITY = _env_int("WS_VIDEO_JPEG_QUALITY", 60)
-VIDEO_SCALE = _env_float("WS_VIDEO_SCALE", 0.75)
+VIDEO_SCALE = _env_float("WS_VIDEO_SCALE", 1.0)
 VIDEO_BITRATE = _env_int("WS_VIDEO_BITRATE", 4_000_000)
 # 可选：WS 降级通道单独限制帧率（0=跟随数字人 25fps）。低配客户端可用 20 换取稳定。
 WS_FPS = _env_int("WS_VIDEO_FPS", 0)
@@ -69,6 +69,10 @@ MAX_WS_MSG = 8 * 1024 * 1024
 # 单次 WS 写入的超时。客户端切桌面/窗口被节流时可能暂时不读 socket，
 # 超时太短（原 5s）会被服务端主动断开；放宽到 60s，切回来还能继续。
 WS_SEND_TIMEOUT = _env_float("WS_SEND_TIMEOUT", 300.0)
+# 链路拥塞阈值：socket 写缓冲超过该值就丢【视频】帧（音频永远不丢）。
+# 手机弱网时一个 H.264 关键帧可能几百 KB，和音频共用发送锁时会把音频堵住，
+# 表现为“声音断流 + 画面越来越慢”。丢视频让客户端保留上一帧、音频继续走。
+WS_SEND_MAX_BUFFER = _env_int("WS_SEND_MAX_BUFFER", 512 * 1024)  # 0=不启用
 
 BIN_JPEG = 0x01
 BIN_PCM = 0x02
@@ -289,6 +293,21 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
             except (ConnectionResetError, ConnectionError, RuntimeError) as exc:
                 await abort_ws("发送失败: %r" % (exc,))
 
+    def _tx_backlogged() -> bool:
+        """客户端读得慢（socket 写缓冲堆积）时返回 True。
+
+        此时应丢视频帧、保音频：视频丢一帧只是少画一下，音频断一下就是“断流”。
+        """
+        if WS_SEND_MAX_BUFFER <= 0:
+            return False
+        tr = request.transport
+        if tr is None:
+            return False
+        try:
+            return tr.get_write_buffer_size() > WS_SEND_MAX_BUFFER
+        except Exception:
+            return False
+
     # ── 先取一帧确定分辨率（同时会拉起渲染线程），再发 ready ──
     first_frame = None
     _t0 = time.monotonic()
@@ -320,35 +339,20 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
         logger.warning("ws_video: 未取到首帧，按形象真实尺寸上报 %dx%d（渲染线程刚启动时会这样，前端可从后续帧自校正）",
                        fw, fh)
 
-    # 画质档位：优先用本会话参数（能力中心「画质档位」），与 WebRTC 同档，
-    # 这样两条通道切换时观感一致。URL &scale= 仍可临时覆盖。
+    # 推理直出：分辨率/帧率取会话原生值，不再按 scale 缩放（2026-11-21）。
     _opt = getattr(avatar_session, "opt", None)
     _sess_fps = int(getattr(_opt, "video_fps", 0) or 0)
     _sess_scale = float(getattr(_opt, "webrtc_scale", 0) or 0)
     _sess_bitrate = int(getattr(_opt, "video_bitrate", 0) or 0)
-    # 会话（能力中心画质档位）优先；env 只在会话没指定时兜底。
-    # 注意：aihuman.env 里 WS_VIDEO_FPS=25 是历史默认值，不能被它压过档位。
     fps = _sess_fps or WS_FPS or int(getattr(request.app.get("opt"), "fps", None) or DEFAULT_FPS)
     logger.info("ws_video: quality fps=%s scale=%s bitrate=%s (env fps=%s scale=%s bitrate=%s)",
                 _sess_fps, _sess_scale, _sess_bitrate, WS_FPS, VIDEO_SCALE, VIDEO_BITRATE)
     frame_interval = 1.0 / max(1, fps)
-    # 每连接缩放：老机器可用 &scale=0.65 降低解码/绘制压力，把 CPU 让给音频
-    scale = _sess_scale or VIDEO_SCALE
+    scale = 1.0
     bitrate = _sess_bitrate or VIDEO_BITRATE
-    try:
-        _req_scale = float(request.query.get("scale", "") or 0)
-        if 0.4 <= _req_scale <= 1.0:
-            scale = _req_scale
-    except (TypeError, ValueError):
-        pass
-    if scale and abs(scale - 1.0) > 0.01:
-        # libx264 + yuv420p 要求宽高为偶数；四舍五入可能得到 675 这类奇数，
-        # 会让 H.264 启动失败并回落到 JPEG（前端因此表现为降级通道连接不稳定）。
-        fw = max(2, int(round(fw * scale / 2.0)) * 2)
-        fh = max(2, int(round(fh * scale / 2.0)) * 2)
 
     # 帧本来就是从 BGR ndarray 建的（HumanPlayer.push_video），to_ndarray 是零拷贝视图；
-    # 缩放用 cv2.resize（0.3ms），比 libswscale 的 reformat（约 4ms）快一个数量级。
+    # 仅下面的静态帧检测缩略图还做一次 1/12 缩放（WS JPEG 专用，约 0.1ms）。
     thumb_w = max(8, fw // 12)
     thumb_h = max(8, fh // 12)
     last_thumb = [None]
@@ -474,6 +478,13 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
                 continue
 
             slot += 1
+
+            if _tx_backlogged():
+                # 拥塞：跳过编码/发送，客户端保留上一帧；推进序号避免音频门控等它
+                _stats['video_bw_dropped'] += 1
+                if seq >= 0 and seq > player.ws_video_sent_seq:
+                    player.ws_video_sent_seq = seq
+                continue
 
             t_enc = time.monotonic()
             try:
@@ -619,6 +630,12 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
                 # 隐藏期间消费掉编码器输出但不发送，防止 ffmpeg 管道积压
                 continue
             key, au, seq = item if len(item) == 3 else (item[0], item[1], -1)
+            if _tx_backlogged():
+                # 拥塞：丢这一帧视频；把「已发出序号」推进，避免音频门控在这里等它
+                _stats['video_bw_dropped'] += 1
+                if seq >= 0 and seq > player.ws_video_sent_seq:
+                    player.ws_video_sent_seq = seq
+                continue
             await send_bytes(bytes((BIN_H264, 1 if key else 0)) + au)
             _stats['aus_sent'] += 1
             # 真正写进 socket 之后才算「视频已发出」，音频门控以此为准
@@ -630,7 +647,8 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
     # 持续解码/绘制，也避免 socket 积压（多开时把资源让给可见的那一路）。
     paused = [False]
     _stats = {'feed_pops': 0, 'feed_none': 0, 'aus_sent': 0,
-              'audio_sent': 0, 'silence_sent': 0, 'audio_lead': 0}
+              'audio_sent': 0, 'silence_sent': 0, 'audio_lead': 0,
+              'video_bw_dropped': 0}
 
     async def _stats_loop():
         while not ws.closed:
@@ -712,12 +730,12 @@ async def ws_video(request: web.Request) -> web.WebSocketResponse:
             logger.info(
                 "[ws-stats] sessionid=%s produced_video=%d produced_audio=%d "
                 "ws_slot=%s feed_pops=%d feed_none=%d aus_sent=%d "
-                "audio_sent=%d silence_sent=%d audio_lead=%d enc=%s",
+                "audio_sent=%d silence_sent=%d audio_lead=%d bw_drop=%d enc=%s",
                 sessionid, getattr(player, 'produced_video', -1),
                 getattr(player, 'produced_audio', -1), vs,
                 _stats['feed_pops'], _stats['feed_none'], _stats['aus_sent'],
                 _stats['audio_sent'], _stats['silence_sent'],
-                _stats.get('audio_lead', 0), es,
+                _stats.get('audio_lead', 0), _stats.get('video_bw_dropped', 0), es,
             )
         except Exception:
             logger.debug("ws_video: stats log failed", exc_info=True)

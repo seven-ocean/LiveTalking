@@ -34,8 +34,9 @@ AUDIO_PTIME = 0.020  # 20ms audio packetization
 VIDEO_CLOCK_RATE = 90000
 VIDEO_PTIME = 0.040 #1 / 25  # 30fps
 VIDEO_TIME_BASE = fractions.Fraction(1, VIDEO_CLOCK_RATE)
-# [fix-publish-webrtc]:76e1155fe5 性能优先：WebRTC 视频轨默认 0.75 下采样后再编码（与 WS 通道一致）
-_WEBRTC_SCALE = max(0.2, min(1.0, float(os.environ.get("ZL_WEBRTC_SCALE", "0.75"))))
+# 推理直出：不再做 0.75 下采样。保留变量只为兼容旧配置/日志；
+# 真正的缩放分支已在 PlayerStreamTrack.recv 删除（2026-11-21）。
+_WEBRTC_SCALE = max(0.2, min(1.0, float(os.environ.get("ZL_WEBRTC_SCALE", "1.0"))))
 SAMPLE_RATE = 16000
 # 播放采样率统一到 48k：WebRTC/Opus 的原生时钟就是 48k，多数声卡也是 48k。
 # 这样播放链路在服务端和浏览器两端都**不需要重采样**（44.1k 时 44.1↔48 每边都要转一次）。
@@ -262,15 +263,6 @@ class PlayerStreamTrack(MediaStreamTrack):
 
         if self.kind == 'video':
             self._player._webrtc_video_pull_ts = time.monotonic()
-            _scale = getattr(self._player, "webrtc_scale", _WEBRTC_SCALE)
-            if _scale < 0.999:
-                try:
-                    # [fix-publish-webrtc]:711b4f0f05 下采样后再交给 libx264，降低 CPU/带宽
-                    nw = max(2, int(round(frame.width * _scale / 2.0)) * 2)
-                    nh = max(2, int(round(frame.height * _scale / 2.0)) * 2)
-                    frame = frame.reformat(width=nw, height=nh)
-                except Exception:
-                    pass
         if self.kind == 'audio':
             # ── 音频时间戳必须按「采样数」单调推进，不能跟墙钟走 ──────────
             # 之前用 (now - start) * rate 当 pts：只要这一帧晚了 80ms，就把 start
@@ -349,7 +341,16 @@ def player_worker_thread(
     quit_event,
     container
 ):
-    container.render(quit_event)
+    # render() 只能跑一条：重复启动时直接退出，避免两套推理/合成线程抢 GPU
+    begin = getattr(container, "begin_render", None)
+    end = getattr(container, "end_render", None)
+    if begin is not None and not begin():
+        return
+    try:
+        container.render(quit_event)
+    finally:
+        if end is not None:
+            end()
 
 
 class _FifoSlot:
@@ -411,6 +412,12 @@ class HumanPlayer:
     ):
         self.__thread: Optional[threading.Thread] = None
         self.__thread_quit: Optional[threading.Event] = None
+        # 历史上启动过的 worker 线程（含 _stop 超时后遗留的）：会话销毁时全部收掉，
+        # 否则每次重连/pc 重建都可能多留一条 render 循环，越切越卡。
+        self.__spawned: list = []
+        # 会话已销毁标记：pc 如果还没关掉，track 重连会再次 _start，把 render 循环
+        # 重新拉起来（删掉的会话继续产帧）。置位后一律拒绝重启。
+        self.__closed = False
 
         # examine streams
         self.__started: Set[PlayerStreamTrack] = set()
@@ -802,22 +809,39 @@ class HumanPlayer:
         """
         return self.__video
 
+    def __ensure_worker(self, why: str) -> None:
+        if self.__closed:
+            self.__log_debug("skip worker start (%s): player closed", why)
+            return
+        """确保只有一条 render 循环在跑。
+
+        `_stop()` 只 join 200ms，超时会把线程丢给后台；此后 `__thread` 已被置空，
+        下一次 `_start`/`ensure_worker` 会再起一条 —— 两条 render 循环同时跑推理，
+        表现就是「切换/重连越多越卡」。这里先复用还活着的线程，没有才新建。
+        """
+        live = [(t, e) for (t, e) in self.__spawned if t.is_alive()]
+        self.__spawned = live
+        if live:
+            self.__thread, self.__thread_quit = live[-1]
+            return
+        self.__log_debug("Starting worker thread (%s)", why)
+        quit_event = threading.Event()
+        thread = threading.Thread(
+            name="media-player",
+            target=player_worker_thread,
+            args=(quit_event, self.__container),
+        )
+        self.__thread_quit = quit_event
+        self.__thread = thread
+        self.__spawned.append((thread, quit_event))
+        thread.start()
+
     def _start(self, track: PlayerStreamTrack) -> None:
         self.__started.add(track)
         if getattr(track, 'kind', '') == 'video':
             self._webrtc_video_active = True
-        if self.__thread is None:
-            self.__log_debug("Starting worker thread")
-            self.__thread_quit = threading.Event()
-            self.__thread = threading.Thread(
-                name="media-player",
-                target=player_worker_thread,
-                args=(
-                    self.__thread_quit,
-                    self.__container
-                ),
-            )
-            self.__thread.start()
+        if self.__thread is None or not self.__thread.is_alive():
+            self.__ensure_worker("_start")
 
     def ensure_worker(self) -> None:
         """确保渲染线程已启动（WS 降级通道专用，幂等）。
@@ -829,18 +853,50 @@ class HumanPlayer:
            `_stop` 看到「没有任何消费者」会把渲染线程停掉 —— 实测连接后约 2s 就断流。
         """
         self.__started.add(_WS_CONSUMER)
-        if self.__thread is None:
-            self.__log_debug("Starting worker thread (ensure_worker)")
-            self.__thread_quit = threading.Event()
-            self.__thread = threading.Thread(
-                name="media-player",
-                target=player_worker_thread,
-                args=(
-                    self.__thread_quit,
-                    self.__container
-                ),
-            )
-            self.__thread.start()
+        if self.__thread is None or not self.__thread.is_alive():
+            self.__ensure_worker("ensure_worker")
+
+    def force_stop(self, timeout: float = 1.0) -> None:
+        """会话被销毁时强制停掉 worker 线程。
+
+        `_stop()` 只 join 200ms，超时就把线程丢给后台清理；频繁切换会累积残留线程
+        继续跑推理/渲染抢 GPU（现场见过移除后仍打 6 分钟 [perf] 的会话）。
+        这里在会话真正销毁时再等一次，并清掉消费者集合。
+        """
+        self.__closed = True
+        self.__started.clear()
+        self._webrtc_video_active = False
+        workers = list(self.__spawned)
+        if self.__thread is not None and all(t is not self.__thread for t, _ in workers):
+            workers.append((self.__thread, self.__thread_quit))
+        for _, ev in workers:
+            if ev is not None:
+                ev.set()
+        if self.__thread_quit is not None:
+            self.__thread_quit.set()
+        self.__thread = None
+
+        deadline = time.monotonic() + max(0.1, timeout)
+        for th, _ in workers:
+            if th.is_alive():
+                th.join(timeout=max(0.05, deadline - time.monotonic()))
+        alive = [(t, e) for t, e in workers if t.is_alive()]
+        if alive:
+            # 不在事件循环里长等（render 收尾要 join 推理/合成线程，最长 6s+），
+            # 后台再盯 15s：真停不下来才告警，并保留引用便于排查。
+            def _wait(pending):
+                end = time.monotonic() + 15.0
+                for th, _ in pending:
+                    th.join(timeout=max(0.0, end - time.monotonic()))
+                still = [f"{t.name}#{t.ident}" for t, _ in pending if t.is_alive()]
+                if still:
+                    mylogger.warning(
+                        "HumanPlayer worker thread still alive 15s after force_stop: %s", still
+                    )
+
+            threading.Thread(
+                target=_wait, args=(alive,), name="player-force-stop", daemon=True
+            ).start()
 
     def release_worker(self) -> None:
         """WS 断连后调用：注销占位消费者，没有其它消费者时停掉渲染线程。"""

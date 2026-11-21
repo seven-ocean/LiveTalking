@@ -27,11 +27,10 @@ import os
 import time
 import cv2
 import glob
-import resampy
 import soxr
 import queue
 from queue import Queue
-from threading import Thread, Event
+from threading import Thread, Event, Lock
 from io import BytesIO
 import soundfile as sf
 import asyncio
@@ -74,6 +73,26 @@ class AudioFrameData:
 
 
 class BaseAvatar:
+    # 同一会话只允许一条 render 循环：pc 重建/WS 降级通道并发时会各自拉起一条
+    # worker，而 render() 里的 quit_event 是每次调用独立的，会被后者覆盖 ——
+    # 旧循环永远等不到 stop，切得越多残留的推理/合成线程越多，表现为越来越卡。
+    _render_guard = Lock()
+
+    def begin_render(self) -> bool:
+        with BaseAvatar._render_guard:
+            if getattr(self, "_render_active", False):
+                logger.warning(
+                    "[%s] render 重复启动被拒绝（同一会话只允许一条渲染循环）",
+                    getattr(self, "sessionid", "?"),
+                )
+                return False
+            self._render_active = True
+            return True
+
+    def end_render(self) -> None:
+        with BaseAvatar._render_guard:
+            self._render_active = False
+
     def __init__(self, opt):
         self.opt = opt
         self.sample_rate = 16000
@@ -257,8 +276,14 @@ class BaseAvatar:
             stream = stream[:, 0]
     
         if sample_rate != self.sample_rate and stream.shape[0] > 0:
-            logger.info(f'[WARN] audio sample rate is {sample_rate}, resampling into {self.sample_rate}.')
-            stream = resampy.resample(x=stream, sr_orig=sample_rate, sr_new=self.sample_rate)
+            n_in = int(stream.shape[0])
+            t0 = time.perf_counter()
+            # 口型模型要求 16k：这里只做一次 48k/44.1k -> 16k。
+            # 用 soxr 替代 resampy（实测 5s/48k：126ms -> 0.9ms）。
+            stream = soxr.resample(stream, sample_rate, self.sample_rate)
+            cost = (time.perf_counter() - t0) * 1000.0
+            logger.info('[conv] audio %d->%d samples=%d cost=%.1fms',
+                        sample_rate, self.sample_rate, n_in, cost)
 
         return stream
 
@@ -596,7 +621,7 @@ class BaseAvatar:
             if current_speaking != last_speaking:
                 logger.info(f"inference 状态切换：{'说话' if last_speaking else '静音'} → {'说话' if current_speaking else '静音'}")
                 last_speaking = current_speaking         
-        logger.info('baseavatar inference thread stop')
+        logger.info('[render] inference stop session=%s thread=%s', getattr(self,'sessionid','?'), __import__('threading').current_thread().ident)
 
     def process_frames(self,quit_event):
         enable_transition = False  # 设置为False禁用过渡效果，True启用
@@ -699,9 +724,11 @@ class BaseAvatar:
             #     self.output._cam.sleep_until_next_frame()
 
         self.output.stop()
-        logger.info('baseavatar process_frames thread stop') 
+        logger.info('[render] process_frames stop session=%s thread=%s', getattr(self,'sessionid','?'), __import__('threading').current_thread().ident) 
 
     def render(self,quit_event):
+        import threading as _th
+        logger.info('[render] start session=%s thread=%s', getattr(self, 'sessionid', '?'), _th.current_thread().ident)
         self.quit_event = quit_event
         
         self.init_customindex()
@@ -835,7 +862,7 @@ class BaseAvatar:
                     time.sleep(min(0.05, _left))
             else:
                 _deadline = _now  # 落后则重新对齐，避免越睡越慢
-        logger.info('baseavatar render thread stop')
+        logger.info('[render] stop session=%s thread=%s', getattr(self,'sessionid','?'), __import__('threading').current_thread().ident)
 
         infer_quit_event.set()
         infer_thread.join(timeout=3.0)

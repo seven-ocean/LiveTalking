@@ -173,7 +173,16 @@ class SessionManager:
 
     def remove_session(self, sessionid: str):
         """销毁会话资源"""
+        avatar_session = self.sessions.get(sessionid)
         self.stop_session(sessionid)
+        # 兜底：HumanPlayer 的 worker 线程在 _stop() 里只等 200ms，超时就丢给后台；
+        # 切换频繁时会累积残留线程持续跑推理/渲染抢 GPU，这里再强制收一次。
+        try:
+            player = getattr(getattr(avatar_session, "output", None), "_player", None)
+            if player is not None and hasattr(player, "force_stop"):
+                player.force_stop()
+        except Exception:
+            logger.exception("强制停止 HumanPlayer 失败 sessionid=%s", sessionid)
         if sessionid in self.sessions:
             logger.info(f"Removing session {sessionid}")
             self.sessions.pop(sessionid, None)

@@ -269,8 +269,17 @@ async def _sender_stats_loop(player, pc) -> None:
             if pc.connectionState in ('closed', 'failed'):
                 return
             st = await sender.getStats()
-            # aiortc 的 getStats() 返回**列表**（原来按对象取 bytesSent 恒为 0 → vbps 一直 0）
-            if isinstance(st, (list, tuple)):
+            # aiortc 的 getStats() 可能是 list，也可能是 RTCStatsReport（dict-like）。
+            # 之前只处理 list，dict 形态下直接取 st.bytesSent 恒为 0，[perf] vbps 一直是 0。
+            vals = None
+            if hasattr(st, 'values'):
+                try:
+                    vals = list(st.values())
+                except Exception:
+                    vals = None
+            if vals is not None:
+                total = sum(int(getattr(x, 'bytesSent', 0) or 0) for x in vals)
+            elif isinstance(st, (list, tuple)):
                 total = sum(int(getattr(x, 'bytesSent', 0) or 0) for x in st)
             else:
                 total = int(getattr(st, 'bytesSent', 0) or 0)
@@ -281,32 +290,6 @@ async def _sender_stats_loop(player, pc) -> None:
             player.vtb = int(getattr(enc, 'target_bitrate', 0) or 0) if enc is not None else 0
         except Exception:
             continue
-
-
-def _requested_fps(params) -> int:
-    """URL ?video_fps=24 → 24；未指定返回 0（不参与比对）。"""
-    for key in ("video_fps", "videoFps"):
-        try:
-            v = params.get(key)
-            if v:
-                n = int(float(v))
-                return n if 1 <= n <= 25 else 0
-        except (TypeError, ValueError, AttributeError):
-            pass
-    return 0
-
-
-def _requested_short(params) -> int:
-    """从 offer 参数里取客户端要的**短边**（0 = 未指定/原画，由服务端按素材决定）。"""
-    for key in ("video_short", "video_short_side", "video_height", "videoHeight"):
-        try:
-            v = params.get(key)
-            if v:
-                return int(float(v))
-        except (TypeError, ValueError, AttributeError):
-            pass
-    q = str(params.get("video_quality") or params.get("videoQuality") or "").strip().lower()
-    return {"540p": 540, "720p": 720, "1080p": 1080}.get(q, 0)
 
 
 def _webrtc_video_enabled() -> bool:
@@ -335,10 +318,15 @@ class RTCManager:
         """
         self.opt = opt
         self.pcs: set = set()
+        # 标签页 → 会话：前端每页带 client_tab，用来把「同形象复用」限制在同一标签页内，
+        # 避免发布页/公开页两路被合并成同一个会话（关一路会把另一路也杀掉）。
+        self.session_tab: Dict[str, str] = {}
         # HTTP-FLV 降级通道的推流：sessionid -> {publisher, player, own_session, last_ping}
         self.flv_publishers: Dict[str, dict] = {}
         # 并发 publish（多标签页/重试）会各起一路 ffmpeg 抢同一个流名，必须串行化
         self._flv_publish_lock = asyncio.Lock()
+        # 由 app.py 注入：返回当前常驻模型信息，供 /capacity 展示显存占用来源
+        self.model_stats_provider = None
 
     # pc 判定为「仍在尝试连接」的宽限期：超过它还没 connected，就认为是死连接。
     # 依据：ICE 连不上时 aiortc 的 connectionState 会**长期停在 connecting/checking**、
@@ -469,6 +457,10 @@ class RTCManager:
             if sid:
                 session_manager.stop_session(sid)
                 session_manager.remove_session(sid)
+                self.session_tab.pop(sid, None)
+                # 会话释放了但 pc 还活着的话，pc 的 track 重新 _start 会把 render 循环
+                # 再拉起来（表现为“删掉的会话还在产帧、越切越卡”），必须一并关掉。
+                await self.drop_session_pcs(sid)
                 logger.info("[capacity] 显式释放会话 sessionid=%s", sid)
             return web.Response(
                 content_type="application/json",
@@ -484,19 +476,37 @@ class RTCManager:
         session_timeout = getattr(self.opt, 'session_timeout', 120.0)
         sessionid = ''
         params_sid = (params.get('sessionid') or '').strip() if isinstance(params, dict) else ''
+        want_tab = (params.get('client_tab') or '').strip() if isinstance(params, dict) else ''
+
+        # 同一标签页切换形象：服务端先释放旧会话，不依赖前端 release beacon 是否送达。
+        # 只在该页形象真的变了才释放；形象相同的并发/重试 offer 仍走下面的复用逻辑。
+        # 否则旧形象帧会一直挂在 global_avatars 里（占内存），旧会话也要等 300s reaper。
+        if want_tab:
+            _want_avatar = params.get('avatar') or getattr(self.opt, 'avatar_id', None)
+            for _sid in list(self.session_tab):
+                if _sid == params_sid or self.session_tab.get(_sid) != want_tab:
+                    continue
+                _old = session_manager.get_session(_sid)
+                if _old is None:
+                    self.session_tab.pop(_sid, None)
+                    continue
+                _old_avatar = getattr(getattr(_old, 'opt', None), 'avatar_id', None)
+                if _want_avatar and _old_avatar and _old_avatar != _want_avatar:
+                    logger.info(
+                        "[session] 同标签页切换形象（%s -> %s），释放旧会话 sessionid=%s",
+                        _old_avatar, _want_avatar, _sid,
+                    )
+                    session_manager.stop_session(_sid)
+                    session_manager.remove_session(_sid)
+                    self.session_tab.pop(_sid, None)
+                    await self.drop_session_pcs(_sid)
 
         def _session_matches(sess_opt) -> bool:
-            """本会话的档位/帧率/节流模式是否与本次 offer 一致。
+            """本会话的节流模式是否与本次 offer 一致。
 
-            不一致必须重建：预热（/warmup）创建的会话不带这些参数，
-            前端重连又常带 sessionid 回来，若不比对就会一直套用 fps=20 的旧会话，
-            URL 上的 pacing/bwcap 永远不生效。
+            分辨率/帧率已固定为推理直出（25fps），不再参与比对；只比对
+            URL 试参带来的 pacing / frame_pace，避免它们复用旧会话不生效。
             """
-            if _requested_short(params) != int(getattr(sess_opt, 'video_short_eff', 0) or 0):
-                return False
-            _wf = _requested_fps(params)
-            if _wf and _wf != int(getattr(sess_opt, 'video_fps', 0) or 0):
-                return False
             _wp = str(params.get('pacing') or '').strip().lower()
             if _wp not in ('legacy', 'official', 'bounded', 'sync25', 'runway'):
                 _wp = 'legacy'
@@ -516,10 +526,7 @@ class RTCManager:
             if (not _explicit_pacing) or _session_matches(_so):
                 sessionid = params_sid
             else:
-                logger.info("[session] 请求参数与会话不符（pacing=%s fps=%s -> pacing=%s fps=%s），重建会话 sessionid=%s",
-                            getattr(_so, 'pacing', ''), getattr(_so, 'video_fps', 0),
-                            str(params.get('pacing') or 'legacy').strip().lower(),
-                            _requested_fps(params), params_sid)
+                logger.info("[session] 试参与会话不符，重建会话 sessionid=%s", params_sid)
                 # 线路容量有限（现场 1/1）：旧会话不先释放，新会话会被「线路已满」拒掉，
                 # 前端于是又退回旧会话（fps=20 / legacy），参数永远不生效。
                 try:
@@ -533,6 +540,9 @@ class RTCManager:
             for sid in reversed(list(session_manager.sessions.keys())):
                 if not session_manager.has_session(sid):
                     continue
+                # 带标签页 ID 时只复用本标签页的会话：两个页面必须是两个 session
+                if want_tab and self.session_tab.get(sid) != want_tab:
+                    continue
                 # WS 降级通道正在进行时绝不能换播放器，否则那条 WS 会收不到帧
                 if session_manager.is_leased(sid):
                     continue
@@ -542,18 +552,6 @@ class RTCManager:
                 sess = session_manager.get_session(sid)
                 sess_opt = getattr(sess, 'opt', None)
                 if getattr(sess_opt, 'avatar_id', None) != want_avatar:
-                    continue
-                # 画质档位（目标高度）变了：不能复用旧会话，否则切档后要等回收才生效
-                if _requested_short(params) != int(getattr(sess_opt, 'video_short_eff', 0) or 0):
-                    logger.info("[quality] 画质档位变化（%s -> %s），重建会话 sessionid=%s",
-                                getattr(sess_opt, 'video_short_eff', 0),
-                                _requested_short(params), sid)
-                    continue
-                # 帧率 / 补齐节拍 也要参与比对：否则改 URL 参数后复用旧会话，新参数不生效
-                _want_fps = _requested_fps(params)
-                if _want_fps and _want_fps != int(getattr(sess_opt, 'video_fps', 0) or 0):
-                    logger.info("[quality] 帧率变化（%s -> %s），重建会话 sessionid=%s",
-                                getattr(sess_opt, 'video_fps', 0), _want_fps, sid)
                     continue
                 # 节流模式变化也要重建会话（否则改 URL 后复用旧会话，新参数不生效）
                 _want_pacing = str(params.get('pacing') or '').strip().lower()
@@ -605,6 +603,16 @@ class RTCManager:
                 extra={"sessionid": sessionid},
             )
             avatar_session = session_manager.get_session(sessionid)
+
+        if want_tab:
+            try:
+                for k in list(self.session_tab):
+                    if not session_manager.has_session(k):
+                        self.session_tab.pop(k, None)
+                self.session_tab[sessionid] = want_tab
+                logger.info("[session] 标签页绑定 sessionid=%s tab=%s", sessionid, want_tab)
+            except Exception:
+                pass
 
         # 资源快照含 time.sleep(0.5) 的 CPU 采样，放到线程池避免阻塞事件循环
         await asyncio.get_event_loop().run_in_executor(
@@ -1036,6 +1044,7 @@ class RTCManager:
             "pcs": len(self.pcs),
             "queue_evict": os.environ.get("TALK_QUEUE_EVICT", "1"),
             "reuse_on_offer": os.environ.get("REUSE_SESSION_ON_OFFER", "1"),
+            "models": self.model_stats_provider() if callable(self.model_stats_provider) else [],
         }
 
     async def shutdown(self):

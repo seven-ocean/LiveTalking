@@ -3,7 +3,6 @@ import queue
 import threading
 import time
 import numpy as np
-import resampy
 import soxr
 import soundfile as sf
 import requests
@@ -268,8 +267,12 @@ class SovitsTTS(BaseTTS):
             stream = stream[:, 0]
     
         if sample_rate != self.sample_rate and stream.shape[0]>0:
-            logger.info(f'[WARN] audio sample rate is {sample_rate}, resampling into {self.sample_rate}.')
-            stream = resampy.resample(x=stream, sr_orig=sample_rate, sr_new=self.sample_rate)
+            n_in = int(stream.shape[0])
+            t0 = time.perf_counter()
+            stream = soxr.resample(stream, sample_rate, self.sample_rate)
+            cost = (time.perf_counter() - t0) * 1000.0
+            logger.info('[conv] audio %d->%d samples=%d cost=%.1fms',
+                        sample_rate, self.sample_rate, n_in, cost)
 
         return stream
 

@@ -87,6 +87,8 @@ _AVATAR_MODULES = {
 # 已就绪的模型运行时：model_name -> {"model": <weights>, "load_avatar": fn}
 _model_runtimes: Dict[str, dict] = {}
 _model_load_lock = Lock()  # 保证同一模型只加载一次（并发去重）
+# 模型最近一次有会话使用的时间：供「空闲模型释放」判断（见 _release_idle_model_runtimes）
+_model_last_used: Dict[str, float] = {}
 
 # ─── avatar 加载状态注册表（线程安全）────────────────────────────────
 # avatar_id -> {"status": "loading"|"ready"|"error", "startedAt": float,
@@ -101,6 +103,7 @@ _avatar_load_lock = Lock()  # 保证同一时刻只有一个 avatar 冷加载（
 # LRU 淘汰，默认保留最近用过的 2 个形象；0 表示不限制。
 _AVATAR_CACHE_MAX = int(os.getenv("ZL_AVATAR_CACHE_MAX", "2"))
 _avatar_last_used: Dict[str, float] = {}
+_avatar_evict_lock = Lock()
 
 # ─── 进程级模型切换 ─────────────────────────────────────────────
 # app.py 只加载一个模型；切换到另一个模型时写目标 avatar 后以 42 退出，
@@ -341,6 +344,7 @@ def ensure_model_runtime(model_name: str) -> dict:
             logger.info("MuseTalk warmup skipped (deferred to first inference)")
         rt = {"model": weights, "load_avatar": avatar_mod.load_avatar}
         _model_runtimes[model_name] = rt
+        _model_last_used[model_name] = time.time()
         logger.info("模型运行时就绪: %s", model_name)
         return rt
 
@@ -380,7 +384,7 @@ def get_or_load_avatar(avatar_id: str):
             _avatar_last_used[avatar_id] = time.time()
             _update_avatar_state(avatar_id, status="ready",
                                  elapsedMs=int((time.time() - started) * 1000))
-            _evict_avatars(keep=avatar_id)
+            _evict_avatars_async(keep=avatar_id)
             return avatar
         except BaseException as e:
             _update_avatar_state(avatar_id, status="error",
@@ -440,6 +444,7 @@ def _evict_avatars(keep: str = "") -> None:
     active = _active_avatar_ids()
     dropped = []
     max_keep = _AVATAR_CACHE_MAX
+    _t0 = time.monotonic()
 
     # 2) 内存护栏
     limit_mb = _cgroup_mem_limit_mb()
@@ -488,8 +493,105 @@ def _evict_avatars(keep: str = "") -> None:
             dropped.append(aid)
 
     if dropped:
-        gc.collect()
-        logger.info("形象缓存已释放: %s（当前 %d 套）", ", ".join(dropped), len(global_avatars))
+        # 不要在这里 gc.collect()：进程里常驻 1~2 套（每套 ~1GB）形象帧，全量 GC
+        # 会持有 GIL 把推理/渲染/事件循环一起卡住 1~4 秒，切换后第一帧表现为掉到 15fps。
+        # 帧数组是 numpy，pop 掉引用后靠引用计数立即释放；循环引用交给解释器自动分代回收。
+        logger.info("形象缓存已释放: %s（当前 %d 套，耗时 %.0fms）",
+                    ", ".join(dropped), len(global_avatars), (time.monotonic() - _t0) * 1000)
+
+
+def _evict_avatars_async(keep: str = "") -> None:
+    """把形象淘汰放到后台线程，避免压在新会话首帧/模型加载的关键路径上。
+
+    同一时刻只允许一个淘汰任务在跑（非阻塞抢锁），抢不到说明已有任务在收尾。
+    """
+    def _run():
+        if not _avatar_evict_lock.acquire(blocking=False):
+            return
+        try:
+            _evict_avatars(keep=keep)
+        except Exception:
+            logger.exception("形象缓存后台淘汰失败")
+        finally:
+            _avatar_evict_lock.release()
+
+    Thread(target=_run, name="avatar-evict", daemon=True).start()
+
+
+def _release_idle_model_runtimes() -> None:
+    """释放长时间没有任何会话使用的模型运行时，把显存还给驱动。
+
+    背景：`TALK_MODEL_SWITCH_MODE=auto` 在显存充足时会让 wav2lip / musetalk
+    两套权重常驻（实测 GPU 11.5GB → 27GB，之后即使没有任何会话也不回落）。
+    两套模型常驻后新会话只剩 ~4GB 余量，切换后会明显更卡。这里在会话回收任务里
+    定期把「无会话 + 空闲超阈值」的模型释放掉；切回旧模型时按懒加载重新加载。
+    """
+    if not _model_runtimes:
+        return
+    try:
+        idle_limit = float(os.environ.get("ZL_MODEL_IDLE_RELEASE_SECONDS", "180"))
+    except (TypeError, ValueError):
+        idle_limit = 180.0
+    if idle_limit <= 0:
+        return
+    if not _model_load_lock.acquire(blocking=False):
+        return  # 正在加载模型，下一轮再判断
+    try:
+        in_use = set()
+        for sess in list(session_manager.sessions.values()):
+            if sess is None:
+                continue
+            opt = getattr(sess, "opt", None)
+            model = getattr(opt, "model", None)
+            if model:
+                in_use.add(model)
+                continue
+            aid = getattr(opt, "avatar_id", None)
+            if aid:
+                try:
+                    in_use.add(resolve_avatar_model(aid))
+                except Exception:
+                    pass
+        now = time.time()
+        for model in in_use:
+            _model_last_used[model] = now
+
+        released = []
+        for model in list(_model_runtimes):
+            if model in in_use:
+                continue
+            last = _model_last_used.get(model)
+            if last is None:
+                _model_last_used[model] = now
+                continue
+            if now - last < idle_limit:
+                continue
+            _model_runtimes.pop(model, None)
+            _model_last_used.pop(model, None)
+            for aid in list(global_avatars):
+                try:
+                    if resolve_avatar_model(aid) != model:
+                        continue
+                    global_avatars.pop(aid, None)
+                    _avatar_last_used.pop(aid, None)
+                    with _avatar_state_lock:
+                        _avatar_state.pop(aid, None)
+                except Exception:
+                    pass
+            released.append(model)
+        if released:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            logger.info(
+                "模型空闲回收: %s（空闲 > %.0fs；剩余常驻 %s）",
+                ", ".join(released), idle_limit, list(_model_runtimes.keys()) or "无",
+            )
+    except Exception:
+        logger.exception("模型空闲回收失败")
+    finally:
+        _model_load_lock.release()
 
 
 def _safe_load_avatar(avatar_id: str):
@@ -560,30 +662,8 @@ def build_avatar_session(sessionid:str, params:dict)->BaseAvatar:
     opt_this.l = _session_int(params, 'l', opt_this.l, 0, 30)
     opt_this.m = _session_int(params, 'm', opt_this.m, 0, 30)
     opt_this.r = _session_int(params, 'r', opt_this.r, 0, 30)
-    requested_fps = _session_int(params, 'fps', opt_this.fps, 1, 60)
-    if requested_fps != 25:
-        logger.warning('fps=%s is not supported, zl-talking requires 25; keep 25', requested_fps)
+    # 分辨率/帧率固定为推理直出：25fps，不做缩放/变速。
     opt_this.fps = 25
-
-    # 弱客户端降载：low_perf / scale 参数降低本会话视频缩放，把 CPU 让给音频，
-    # 避免“一出现画面就电音”的老机器问题。默认沿用进程级 ZL_WEBRTC_SCALE。
-    try:
-        base_scale = float(os.environ.get("ZL_WEBRTC_SCALE", "0.75") or 0.75)
-    except (TypeError, ValueError):
-        base_scale = 0.75
-    opt_this.webrtc_scale = base_scale
-    low_perf = params.get('low_perf')
-    if isinstance(low_perf, str):
-        low_perf = low_perf.strip().lower() in ('1', 'true', 'yes', 'on')
-    if low_perf:
-        opt_this.webrtc_scale = min(base_scale, 0.65)
-    try:
-        req_scale = float(params.get('scale') or 0)
-        if 0.4 <= req_scale <= 1.0:
-            # URL 显式给 ?scale= 时以它为准（现场单机试档）
-            opt_this.webrtc_scale = req_scale
-    except (TypeError, ValueError):
-        pass
 
     # 音频口径（能力中心「音频口径」）：auto = 生产 48k，WS 侧再按客户端设备率自适应；
     # 显式 48000/44100/16000 时整条播放链按该口径生产（WebRTC 线上仍会被 Opus 转到 48k）。
@@ -638,8 +718,6 @@ def build_avatar_session(sessionid:str, params:dict)->BaseAvatar:
     native = _native_size(avatar_this)
     nw, nh = (native if native else (0, 0))
     short = min(nw, nh) if native else 0
-    scale = 1.0
-    eff_short = short
     try:
         fps = int(getattr(opt, 'fps', 25) or 25)
     except (TypeError, ValueError):
@@ -657,8 +735,6 @@ def build_avatar_session(sessionid:str, params:dict)->BaseAvatar:
     opt_this.webrtc_scale = 1.0
     opt_this.video_fps = fps
     opt_this.video_bitrate = bitrate
-    opt_this.video_short_eff = int(eff_short)
-    opt_this.video_height_eff = int(eff_short)   # 兼容旧字段
     if native:
         logger.info('[session] %s 直出 video=%dx%d(short=%d) @%.1fMbps %dfps（不缩放/不降帧）',
                     sessionid, nw, nh, short, bitrate / 1e6, fps)
@@ -918,6 +994,36 @@ def main():
     # init rtc manager
     session_manager.init_builder(build_avatar_session)
     rtc_manager = RTCManager(opt)
+
+    def _model_stats():
+        """当前常驻模型：让 /capacity 一眼看出显存被哪套权重占着。"""
+        counts: Dict[str, int] = {}
+        try:
+            for sess in list(session_manager.sessions.values()):
+                if sess is None:
+                    continue
+                sopt = getattr(sess, "opt", None)
+                model = getattr(sopt, "model", None)
+                if not model:
+                    aid = getattr(sopt, "avatar_id", None)
+                    model = resolve_avatar_model(aid) if aid else None
+                if model:
+                    counts[model] = counts.get(model, 0) + 1
+        except Exception:
+            pass
+        now = time.time()
+        out = []
+        for model in list(_model_runtimes):
+            last = _model_last_used.get(model)
+            out.append({
+                "name": model,
+                "resident": True,
+                "sessions": counts.get(model, 0),
+                "idle": round(now - last, 1) if last else None,
+            })
+        return out
+
+    rtc_manager.model_stats_provider = _model_stats
     # share avatar_sessions (RTCManager handles it but routes.py expects it)
     
     if opt.transport=='virtualcam' or opt.transport=='rtmp':
@@ -972,10 +1078,18 @@ def main():
                                     sid, session_manager.idle_seconds(sid))
                         session_manager.stop_session(sid)
                         session_manager.remove_session(sid)
+                        try:
+                            await rtc_manager.drop_session_pcs(sid)
+                        except Exception:
+                            logger.exception("关闭会话 pc 失败 sessionid=%s", sid)
                 # FLV 降级页每 5s 心跳一次；后台标签页定时器会被浏览器节流，
                 # 阈值给宽松些，避免切走一会儿就被回收（表现为“老是掉线”）。
                 await rtc_manager.reap_flv_publishers(180.0)
                 _evict_avatars()
+                # 空闲模型释放会 empty_cache（可能上百 ms），放线程池避免卡事件循环
+                await asyncio.get_event_loop().run_in_executor(
+                    None, _release_idle_model_runtimes
+                )
             except Exception:
                 logger.exception("session reaper error")
 
@@ -1021,6 +1135,10 @@ def main():
 
         if not sid:
             return web.json_response({"code": 1, "msg": "no idle session"})
+        try:
+            await rtc_manager.drop_session_pcs(sid)
+        except Exception:
+            logger.exception("evict_idle: 关闭 pc 失败 sessionid=%s", sid)
         logger.info("evict_idle(%s): 回收会话 %s", mode, sid)
         return web.json_response({"code": 0, "evicted": sid})
 
@@ -1035,6 +1153,7 @@ def main():
                 "queue_evict": data.get("queue_evict"),
                 "reuse_on_offer": data.get("reuse_on_offer"),
                 "sessions": data.get("sessions", []),
+                "models": data.get("models", []),
             },
         })
 
