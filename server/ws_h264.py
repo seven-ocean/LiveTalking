@@ -82,14 +82,57 @@ def _first_mb_in_slice(nal: bytes) -> int:
 class H264Encoder:
     """把 av.VideoFrame 匀速喂给 ffmpeg，输出按 access unit 切好的 AVCC。"""
 
-    def __init__(self, width: int, height: int, fps: int = 25, bitrate: int = 2_000_000):
+    _PROFILES = ("baseline", "main", "high")
+    _PRESETS = ("ultrafast", "superfast", "veryfast", "faster", "fast", "medium")
+
+    @staticmethod
+    def _env_float(name: str, default: float) -> float:
+        try:
+            return float(os.environ.get(name, default))
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _env_int(name: str, default: int) -> int:
+        try:
+            return int(os.environ.get(name, default))
+        except (TypeError, ValueError):
+            return default
+
+    def __init__(
+        self,
+        width: int,
+        height: int,
+        fps: int = 25,
+        bitrate: int = 2_000_000,
+        preset: str = "",
+        profile: str = "",
+        gop_seconds: float = 0.0,
+        maxrate_factor: float = 0.0,
+        bufsize_factor: float = 0.0,
+        threads: int = 0,
+    ):
         self.width = width
         self.height = height
         self.fps = max(1, fps)
-        self.bitrate = bitrate
-        # GOP 0.4s：掉帧/丢参考帧后，最多 0.4s 就能靠下一个关键帧恢复，
-        # 而不是像 1s GOP 那样整屏马赛克持续一整秒。
-        self._gop = max(1, int(round(self.fps * 0.4)))
+        self.bitrate = max(200_000, int(bitrate))
+        self.preset = (preset or os.environ.get("WS_VIDEO_X264_PRESET", "superfast") or "superfast").strip().lower()
+        if self.preset not in self._PRESETS:
+            self.preset = "superfast"
+        self.profile = (profile or os.environ.get("WS_VIDEO_PROFILE", "baseline") or "baseline").strip().lower()
+        if self.profile not in self._PROFILES:
+            self.profile = "baseline"
+        self.gop_seconds = float(gop_seconds or self._env_float("WS_VIDEO_GOP_SECONDS", 0.8))
+        self.gop_seconds = min(5.0, max(0.1, self.gop_seconds))
+        self.maxrate_factor = float(maxrate_factor or self._env_float("WS_VIDEO_MAXRATE_FACTOR", 1.1))
+        self.maxrate_factor = min(3.0, max(1.0, self.maxrate_factor))
+        self.bufsize_factor = float(bufsize_factor or self._env_float("WS_VIDEO_BUFSIZE_FACTOR", 1.0))
+        self.bufsize_factor = min(4.0, max(0.5, self.bufsize_factor))
+        self.threads = int(threads or self._env_int("WS_VIDEO_X264_THREADS", 2))
+        self.threads = min(16, max(1, self.threads))
+        # GOP 默认 0.8s：掉帧后最多 0.8s 靠关键帧恢复；比 0.4s 少一半 I 帧开销，
+        # 同码率下 P 帧细节更多，画质更接近公开页 WebRTC。
+        self._gop = max(1, int(round(self.fps * self.gop_seconds)))
 
         self.avcc = b""
         self.codec_string = ""
@@ -134,12 +177,13 @@ class H264Encoder:
             "-f", "rawvideo", "-pix_fmt", "bgr24",
             "-s", "%dx%d" % (self.width, self.height),
             "-r", str(self.fps), "-i", "pipe:0",
-            "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-            "-threads", str(max(1, int(os.environ.get("WS_VIDEO_X264_THREADS", "2")))),
-            "-profile:v", "baseline", "-pix_fmt", "yuv420p",
+            "-c:v", "libx264", "-preset", self.preset, "-tune", "zerolatency",
+            "-threads", str(self.threads),
+            "-profile:v", self.profile, "-pix_fmt", "yuv420p",
             "-g", str(self._gop), "-keyint_min", str(self._gop), "-sc_threshold", "0",
-            "-b:v", str(self.bitrate), "-maxrate", str(int(self.bitrate * 1.2)),
-            "-bufsize", str(self.bitrate * 2),
+            "-b:v", str(self.bitrate),
+            "-maxrate", str(max(self.bitrate, int(self.bitrate * self.maxrate_factor))),
+            "-bufsize", str(max(self.bitrate // 2, int(self.bitrate * self.bufsize_factor))),
             "-f", "h264", "pipe:1",
         ]
         self._proc = subprocess.Popen(
@@ -404,6 +448,17 @@ class H264Encoder:
             'feeder_starved': self.feeder_starved,
             'aus': self.aus,
             'async_dropped': self.async_dropped,
+            'width': self.width,
+            'height': self.height,
+            'fps': self.fps,
+            'bitrate': self.bitrate,
+            'profile': self.profile,
+            'preset': self.preset,
+            'gop': self._gop,
+            'gop_seconds': self.gop_seconds,
+            'threads': self.threads,
+            'maxrate': max(self.bitrate, int(self.bitrate * self.maxrate_factor)),
+            'bufsize': max(self.bitrate // 2, int(self.bitrate * self.bufsize_factor)),
         }
 
     # ─── 给 WS 协程使用 ─────────────────────────────────────────────

@@ -415,6 +415,9 @@ class HumanPlayer:
         # 历史上启动过的 worker 线程（含 _stop 超时后遗留的）：会话销毁时全部收掉，
         # 否则每次重连/pc 重建都可能多留一条 render 循环，越切越卡。
         self.__spawned: list = []
+        # worker 启停状态跨线程访问（事件循环 / 异步清理线程），必须加锁。
+        self.__worker_lock = threading.Lock()
+        self.__restart_pending = False
         # 会话已销毁标记：pc 如果还没关掉，track 重连会再次 _start，把 render 循环
         # 重新拉起来（删掉的会话继续产帧）。置位后一律拒绝重启。
         self.__closed = False
@@ -809,21 +812,7 @@ class HumanPlayer:
         """
         return self.__video
 
-    def __ensure_worker(self, why: str) -> None:
-        if self.__closed:
-            self.__log_debug("skip worker start (%s): player closed", why)
-            return
-        """确保只有一条 render 循环在跑。
-
-        `_stop()` 只 join 200ms，超时会把线程丢给后台；此后 `__thread` 已被置空，
-        下一次 `_start`/`ensure_worker` 会再起一条 —— 两条 render 循环同时跑推理，
-        表现就是「切换/重连越多越卡」。这里先复用还活着的线程，没有才新建。
-        """
-        live = [(t, e) for (t, e) in self.__spawned if t.is_alive()]
-        self.__spawned = live
-        if live:
-            self.__thread, self.__thread_quit = live[-1]
-            return
+    def __spawn_worker_locked(self, why: str) -> None:
         self.__log_debug("Starting worker thread (%s)", why)
         quit_event = threading.Event()
         thread = threading.Thread(
@@ -835,6 +824,53 @@ class HumanPlayer:
         self.__thread = thread
         self.__spawned.append((thread, quit_event))
         thread.start()
+
+    def __ensure_worker(self, why: str) -> None:
+        """确保只有一条 render 循环在跑。
+
+        `_stop()` 只 join 200ms，超时会把线程丢给后台；旧线程的 quit_event 已经 set，
+        但线程可能还要 1~6 秒才真正退出。如果这时新连接直接复用旧线程，它马上就会退出，
+        表现为「WS 重连后一直重复最后一帧」。这里区分 running / stopping：
+        - running（event 未 set）：复用；
+        - stopping（event 已 set）：等它真正结束后再起新 worker，避免 begin_render 拒绝。
+        """
+        if self.__closed:
+            self.__log_debug("skip worker start (%s): player closed", why)
+            return
+
+        stopping = []
+        with self.__worker_lock:
+            live = [(t, e) for (t, e) in self.__spawned if t.is_alive() and not e.is_set()]
+            stopping = [(t, e) for (t, e) in self.__spawned if t.is_alive() and e.is_set()]
+            self.__spawned = live
+            if live:
+                self.__thread, self.__thread_quit = live[-1]
+                return
+            self.__thread = None
+            self.__thread_quit = None
+            if stopping:
+                if self.__restart_pending:
+                    return
+                self.__restart_pending = True
+            else:
+                self.__spawn_worker_locked(why)
+                return
+
+        def _restart():
+            for t, _e in stopping:
+                t.join(timeout=15.0)
+            with self.__worker_lock:
+                self.__restart_pending = False
+                if self.__closed or not self.__started:
+                    return
+                live = [(t, e) for (t, e) in self.__spawned if t.is_alive() and not e.is_set()]
+                self.__spawned = live
+                if live:
+                    self.__thread, self.__thread_quit = live[-1]
+                    return
+                self.__spawn_worker_locked(why)
+
+        threading.Thread(target=_restart, name="player-restart", daemon=True).start()
 
     def _start(self, track: PlayerStreamTrack) -> None:
         self.__started.add(track)
@@ -866,15 +902,18 @@ class HumanPlayer:
         self.__closed = True
         self.__started.clear()
         self._webrtc_video_active = False
-        workers = list(self.__spawned)
-        if self.__thread is not None and all(t is not self.__thread for t, _ in workers):
-            workers.append((self.__thread, self.__thread_quit))
-        for _, ev in workers:
-            if ev is not None:
-                ev.set()
-        if self.__thread_quit is not None:
-            self.__thread_quit.set()
-        self.__thread = None
+        with self.__worker_lock:
+            self.__restart_pending = False
+            workers = list(self.__spawned)
+            if self.__thread is not None and all(t is not self.__thread for t, _ in workers):
+                workers.append((self.__thread, self.__thread_quit))
+            for _, ev in workers:
+                if ev is not None:
+                    ev.set()
+            if self.__thread_quit is not None:
+                self.__thread_quit.set()
+            self.__thread = None
+            self.__thread_quit = None
 
         deadline = time.monotonic() + max(0.1, timeout)
         for th, _ in workers:
@@ -907,13 +946,19 @@ class HumanPlayer:
         if not any(getattr(t, 'kind', '') == 'video' for t in self.__started):
             self._webrtc_video_active = False
 
-        if not self.__started and self.__thread is not None:
-            self.__log_debug("Stopping worker thread")
-            self.__thread_quit.set()
-            # 捕获线程引用，避免 _finalize_cleanup 中 self.__thread 被提前置空后无法 join
-            worker_thread = self.__thread
-            self.__thread = None
-
+        worker_thread = None
+        quit_event = None
+        with self.__worker_lock:
+            if not self.__started and self.__thread is not None:
+                self.__log_debug("Stopping worker thread")
+                # 捕获线程引用和 event，避免 _finalize_cleanup 中 self.__thread 被置空后无法 join
+                worker_thread = self.__thread
+                quit_event = self.__thread_quit
+                self.__thread = None
+                self.__thread_quit = None
+        if worker_thread is not None:
+            if quit_event is not None:
+                quit_event.set()
             # 先在当前线程尝试快速 join（最多 200ms），若失败则放到守护线程异步清理，
             # 避免阻塞 asyncio 事件循环（PlayerStreamTrack.stop 可能在事件循环线程被调用）。
             worker_thread.join(timeout=0.2)
@@ -923,7 +968,7 @@ class HumanPlayer:
                 )
                 cleanup_thread = threading.Thread(
                     target=self._finalize_cleanup,
-                    args=(worker_thread, self.__thread_quit),
+                    args=(worker_thread, quit_event),
                     daemon=True,
                 )
                 cleanup_thread.start()
