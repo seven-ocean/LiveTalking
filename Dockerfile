@@ -35,7 +35,10 @@ RUN source ~/.bashrc
 RUN conda create -n nerfstream python=3.10
 RUN conda activate nerfstream
 
-RUN pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/
+# 团队策略：本地 Nexus 优先 → 国内镜像（阿里云）→ 官方 pypi 兜底
+RUN pip config set global.index-url http://192.168.31.248:38081/nexus/repository/pypi-public-local/simple/ \
+ && pip config set global.extra-index-url "https://mirrors.aliyun.com/pypi/simple/ https://pypi.org/simple" \
+ && pip config set global.trusted-host 192.168.31.248
 # install depend
 RUN conda install pytorch==1.12.1 torchvision==0.13.1 cudatoolkit=11.3 -c pytorch
 Copy requirements.txt ./
