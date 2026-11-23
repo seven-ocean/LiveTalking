@@ -16,6 +16,11 @@ from aiohttp import web
 from aiortc import RTCPeerConnection, RTCSessionDescription, RTCIceServer, RTCConfiguration
 from aiortc.rtcrtpsender import RTCRtpSender
 
+try:
+    from server.sdp_sanitize import sanitize_answer_sdp, describe_sdp
+except ImportError:  # direct script execution
+    from sdp_sanitize import sanitize_answer_sdp, describe_sdp
+
 # aiortc 默认码率是按“窄带会议”设的（H264 1Mbps / VP8 500kbps），
 # 对 720p/1080p 数字人画面明显偏低，表现为静态待机时画面发糊、细节丢失。
 # 这里在进程内把默认/下限/上限码率抬到适合数字人的范围（无需改第三方包文件）：
@@ -62,86 +67,22 @@ def _rewrite_sdp_public_ip(sdp: str) -> str:
     return sdp
 
 
-_SETUP_LINE_RE = re.compile(r"^a=setup:(\S+)\s*$")
-
-
-def _hoist_setup_to_session(sdp: str) -> str:
-    """把媒体级的 a=setup 提升到会话级。
-
-    RFC 4145 / JSEP 规定 a=setup 只能作为会话级属性；aiortc 的
-    MediaDescription.to_sdp() 会把它写进每个 m= 段。旧版 Chrome 容忍这种写法，
-    新版 Chrome/Edge 的 SDP 解析器会直接拒绝：
-      Failed to parse SessionDescription. a=setup:active Invalid SDP line.
-    这里统一提到 m= 之前（会话级），媒体段里的副本删除。
-    """
-    if "a=setup:" not in sdp:
-        return sdp
-    lines = sdp.splitlines()
-    media_setups = []
-    session_setup = None
-    in_media = False
-    out = []
-    for line in lines:
-        if line.startswith("m="):
-            in_media = True
-        m = _SETUP_LINE_RE.match(line)
-        if m:
-            if in_media:
-                media_setups.append(m.group(1))
-                continue
-            if session_setup is None:
-                session_setup = m.group(1)
-        out.append(line)
-    if not media_setups:
-        return sdp
-    if session_setup is None:
-        first_media = next((i for i, l in enumerate(out) if l.startswith("m=")), len(out))
-        t_index = next((i for i, l in enumerate(out[:first_media]) if l.startswith("t=")), None)
-        insert_at = (t_index + 1) if t_index is not None else first_media
-        out.insert(insert_at, f"a=setup:{media_setups[0]}")
-    if len(set(media_setups)) > 1:
-        webrtc_log.warning(
-            "SDP has mixed media-level a=setup %s, hoisted %s to session level",
-            sorted(set(media_setups)), media_setups[0],
-        )
-    return "\r\n".join(out) + "\r\n"
-
-
-_FINGERPRINT_RE = re.compile(r"^a=fingerprint:([A-Za-z0-9-]+)\s")
-
-
-def _keep_sha256_fingerprints(sdp: str) -> str:
-    """只保留 sha-256 的 a=fingerprint。
-
-    aiortc 会同时给 sha-256/sha-384/sha-512 三条；新版 Chrome 的 SDP 解析器
-    只接受 sha-256（现场报 `a=fingerprint:sha-512 ... Invalid SDP line`）。
-    DTLS 校验用同一张证书，保留 sha-256 足够。
-    """
-    if "a=fingerprint:" not in sdp:
-        return sdp
-    lines = sdp.splitlines()
-    has_sha256 = any(
-        (m := _FINGERPRINT_RE.match(line)) and m.group(1).lower() == "sha-256"
-        for line in lines
-    )
-    if not has_sha256:
-        return sdp
-    out = []
-    dropped = 0
-    for line in lines:
-        m = _FINGERPRINT_RE.match(line)
-        if m and m.group(1).lower() != "sha-256":
-            dropped += 1
-            continue
-        out.append(line)
-    if dropped:
-        webrtc_log.info("SDP: dropped %d non-sha256 fingerprint line(s) for Chrome parser", dropped)
-    return "\r\n".join(out) + "\r\n"
-
-
 def _normalize_answer_sdp(sdp: str) -> str:
-    """把 aiortc 生成的 answer 归一成新版 Chrome 能解析的形式。"""
-    return _keep_sha256_fingerprints(_hoist_setup_to_session(sdp))
+    """把 aiortc 生成的 answer 归一成 Electron 25/Chromium 114 能解析的形式。
+
+    除 fingerprint/setup 外，还处理现场报的
+    `a=ice-pwd:... Invalid SDP line`：ICE 凭据只保留媒体级、每段一对，
+    并修复重复/拼接/脏字符行；同时过滤 tcp/回环/docker 网桥候选。
+    """
+    if not sdp:
+        return sdp
+    cleaned = sanitize_answer_sdp(sdp)
+    if cleaned != sdp:
+        webrtc_log.info(
+            "SDP sanitized: before=%s after=%s",
+            describe_sdp(sdp), describe_sdp(cleaned),
+        )
+    return cleaned
 
 
 def _session_player_closed(sess) -> bool:
