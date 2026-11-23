@@ -6,6 +6,7 @@
 
 - 客户线上只通过 release 包更新，不直接改线上文件。
 - 每次客户更新 = release id `YYYY.MM.DD-NN` + git tag `release/<id>` + `releases/<id>/MANIFEST.json`/`CHANGELOG.md`/包 sha256。
+- 交付包只放在 `releases/<release-id>/`，不要放 `/data/shuziren/zl` 根目录；根目录只保留源码、安装树和工具。
 - 交付包必须含 `apply.sh`/`verify.sh`/`rollback.sh`/`README.txt`/`SHA256SUMS`/`source-patches/`；前端改动含 `web-dist/`。
 - 禁止生产密码/密钥入库/入包；禁止提交 `.ipynb_checkpoints/`、`dist/`、`node_modules/`、`runtime/data/`、`logs/`。
 - 离线：不用公网 STUN/CDN/在线依赖；依赖来自本地 wheels/仓库。
