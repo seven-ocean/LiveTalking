@@ -2,6 +2,19 @@
 
 分支：`feature/aihumanV2-MetaXC500`。**客户特供版，不轻易切换分支**；操作前 `git branch --show-current`，不是预期分支立即停止并询问用户。核心：aiortc / HumanPlayer / SDP / WS 降级。
 
+## 通用交付约束（客户离线版）
+
+- 客户线上只通过 release 包更新，不直接改线上文件。
+- 每次客户更新 = release id `YYYY.MM.DD-NN` + git tag `release/<id>` + `releases/<id>/MANIFEST.json`/`CHANGELOG.md`/包 sha256。
+- 交付包必须含 `apply.sh`/`verify.sh`/`rollback.sh`/`README.txt`/`SHA256SUMS`/`source-patches/`；前端改动含 `web-dist/`。
+- 禁止生产密码/密钥入库/入包；禁止提交 `.ipynb_checkpoints/`、`dist/`、`node_modules/`、`runtime/data/`、`logs/`。
+- 离线：不用公网 STUN/CDN/在线依赖；依赖来自本地 wheels/仓库。
+- 先对比真实生产 `runtime/conf`，不按默认模板猜拓扑；`web-dist` 删旧再整体替换，`index.html` no-store。
+- 必须备份、可回滚、验证：构建/语法、单测、sha256、mock 安装根、`nginx -t`、端口/健康检查。
+- 分支纪律：当前 `zl-*` 分支是客户特供版，不轻易切换/新建/合并；改动前 `git branch --show-current`；不一致立即停止并询问用户。
+- 端口基线：51000/TCP（port_mux：web、`/prod-api`、`/zltalk-ws`、TURN/TCP）、51000/UDP（TURN/UDP）、51001/TCP（`/ws/desktop` 等）、32768–60999/UDP（WebRTC 直连媒体）；内部端口只本机。
+- 已知坑：51000 可能是 port_mux→51090；51001 可能缺 `/prod-api`；111=zl-ai 51011 不在；turn/udpmux 要显式重启；Electron 25 需全量 SDP sanitize；待机只在 live 异常时出现且保留唤醒词。
+
 ## 启动与端口
 
 - `tcp_proxy.py`：51004（对外代理，nginx `/zltalk-ws/` 指向这里）
