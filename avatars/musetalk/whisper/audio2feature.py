@@ -9,18 +9,56 @@ from transformers import WhisperModel
 import torch
 sys.path.append("..")
 
+try:
+    from utils.logger import logger
+except Exception:  # 允许脱离项目根目录单独调试本模块
+    import logging
+    logger = logging.getLogger(__name__)
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 weight_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 class Audio2Feature():
     def __init__(self, 
                  whisper_model_type="tiny",
-                 model_path="./models/whisper"):
-        # self.whisper_model_type = whisper_model_type
-        # self.model = load_model(model_path) #
+                 model_path="./models/whisper",
+                 use_onnx=False,
+                 onnx_model_path=None):
+        self.model_path = model_path
         self.feature_extractor = AutoFeatureExtractor.from_pretrained(model_path)
-        self.whisper = WhisperModel.from_pretrained(model_path)
-        self.whisper = self.whisper.to(device=device, dtype=weight_dtype).eval()
-        self.whisper.requires_grad_(False)
+        self.whisper = None
+        self.session = None
+        self.input_name = None
+        self.use_onnx = False
+
+        if use_onnx and onnx_model_path:
+            if not os.path.exists(onnx_model_path):
+                logger.warning("Whisper ONNX 模型不存在，回退 PyTorch: %s", onnx_model_path)
+            else:
+                try:
+                    import onnxruntime as ort
+                    try:
+                        from utils.device import get_onnx_providers
+                        providers = get_onnx_providers()
+                    except Exception:
+                        providers = ['CPUExecutionProvider']
+                    self.session = ort.InferenceSession(onnx_model_path, providers=providers)
+                    self.input_name = self.session.get_inputs()[0].name
+                    self.use_onnx = True
+                    logger.info("Whisper ONNX encoder: %s providers=%s",
+                                onnx_model_path, self.session.get_providers())
+                except Exception:
+                    logger.exception("Whisper ONNX 初始化失败，回退 PyTorch: %s", onnx_model_path)
+                    self.session = None
+
+        if not self.use_onnx:
+            self._ensure_torch()
+
+    def _ensure_torch(self):
+        """懒加载 PyTorch Whisper，作为非 ONNX 路径或 ONNX 失败时的回退。"""
+        if self.whisper is None:
+            self.whisper = WhisperModel.from_pretrained(self.model_path)
+            self.whisper = self.whisper.to(device=device, dtype=weight_dtype).eval()
+            self.whisper.requires_grad_(False)
 
     def get_sliced_feature(self,
                            feature_array, 
@@ -109,6 +147,20 @@ class Audio2Feature():
             return_tensors="pt",
             sampling_rate=16000
         ).input_features
+
+        # ONNX 导出图的输出已是 stack(dim=2) 后的 [1, 1500, 5, 384]
+        if self.use_onnx:
+            try:
+                feat_np = input_feature.cpu().numpy().astype(np.float32)
+                out = self.session.run(None, {self.input_name: feat_np})[0]
+                np_dtype = np.float16 if weight_dtype == torch.float16 else np.float32
+                return out[0].astype(np_dtype)
+            except Exception:
+                logger.exception("Whisper ONNX 推理失败，回退 PyTorch 继续本轮")
+                self.use_onnx = False
+                self.session = None
+                self._ensure_torch()
+
         input_feature = input_feature.to(device).to(weight_dtype)
         whisper_feature = self.whisper.encoder(input_feature, output_hidden_states=True).hidden_states
         #print(f"input_feature shape:{input_feature.shape}, whisper_feature shape:{whisper_feature[0].shape}, whisper_feature len:{len(whisper_feature)}")
