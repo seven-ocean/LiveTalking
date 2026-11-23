@@ -1,6 +1,6 @@
 # AGENTS.md — zl-talking（Python WebRTC 服务端）
 
-分支：`feature/aihumanV2-MetaXC500`。核心：aiortc / HumanPlayer / SDP / WS 降级。
+分支：`feature/aihumanV2-MetaXC500`。**客户特供版，不轻易切换分支**；操作前 `git branch --show-current`，不是预期分支立即停止并询问用户。核心：aiortc / HumanPlayer / SDP / WS 降级。
 
 ## 启动与端口
 
