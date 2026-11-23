@@ -9,6 +9,7 @@
 - 全量包：`releases/full-<version>-<id>/`，固定三件 `full-<version>-<id>-part1-app/part2-models/part3-avatars.tar.gz`，tag `full/<version>-<id>`。
 - 交付包只放在 `releases/patch-<id>/` 或 `releases/full-<version>-<id>/`，不要放 `/data/shuziren/zl` 根目录；根目录只保留源码、安装树和工具。
 - 全量包由 `aihuman_offline_real` 生成，固定三件：`part1-app`（源码+离线依赖+中间件+运行环境）、`part2-models`、`part3-avatars`；不要拆成更多分卷。
+- 全量包 `part3-avatars` 只保留生产在用形象；测试/重复形象（如 `wav2lip256_avatar10_test`、`musetalk_avater_test_5`）不打包。
 - 交付包必须含 `apply.sh`/`verify.sh`/`rollback.sh`/`README.txt`/`SHA256SUMS`/`source-patches/`；前端改动含 `web-dist/`。
 - 禁止生产密码/密钥入库/入包；禁止提交 `.ipynb_checkpoints/`、`dist/`、`node_modules/`、`runtime/data/`、`logs/`。
 - 离线：不用公网 STUN/CDN/在线依赖；依赖来自本地 wheels/仓库。
