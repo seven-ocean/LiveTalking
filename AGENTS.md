@@ -5,8 +5,9 @@
 ## 通用交付约束（客户离线版）
 
 - 客户线上只通过 release 包更新，不直接改线上文件。
-- 每次客户更新 = release id `YYYY.MM.DD-NN` + git tag `release/<id>` + `releases/<id>/MANIFEST.json`/`CHANGELOG.md`/包 sha256。
-- 交付包只放在 `releases/<release-id>/`，不要放 `/data/shuziren/zl` 根目录；根目录只保留源码、安装树和工具。
+- 增量包：release id `YYYY.MM.DD-NN` + git tag `patch/<id>` + `releases/patch-<id>/`（`patch-<id>.tar.gz`、MANIFEST、CHANGELOG、sha256）。
+- 全量包：`releases/full-<version>-<id>/`，固定三件 `full-<version>-<id>-part1-app/part2-models/part3-avatars.tar.gz`，tag `full/<version>-<id>`。
+- 交付包只放在 `releases/patch-<id>/` 或 `releases/full-<version>-<id>/`，不要放 `/data/shuziren/zl` 根目录；根目录只保留源码、安装树和工具。
 - 全量包由 `aihuman_offline_real` 生成，固定三件：`part1-app`（源码+离线依赖+中间件+运行环境）、`part2-models`、`part3-avatars`；不要拆成更多分卷。
 - 交付包必须含 `apply.sh`/`verify.sh`/`rollback.sh`/`README.txt`/`SHA256SUMS`/`source-patches/`；前端改动含 `web-dist/`。
 - 禁止生产密码/密钥入库/入包；禁止提交 `.ipynb_checkpoints/`、`dist/`、`node_modules/`、`runtime/data/`、`logs/`。
