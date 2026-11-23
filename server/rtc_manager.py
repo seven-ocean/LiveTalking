@@ -144,6 +144,17 @@ def _normalize_answer_sdp(sdp: str) -> str:
     return _keep_sha256_fingerprints(_hoist_setup_to_session(sdp))
 
 
+def _session_player_closed(sess) -> bool:
+    """会话的 HumanPlayer 是否已关闭；关闭的 player 不能再复用。"""
+    player = getattr(getattr(sess, "output", None), "_player", None)
+    if player is None:
+        return True
+    try:
+        return bool(getattr(player, "closed", False))
+    except Exception:
+        return False
+
+
 async def _wait_ice_gathering(pc, timeout: float = 3.0) -> None:
     """等 aiortc 收集完 ICE 候选再返回 answer，避免 SDP 里没有 candidate。"""
     if pc.iceGatheringState == "complete":
@@ -522,8 +533,16 @@ class RTCManager:
             'legacy', 'official', 'bounded', 'sync25')
         if (params_sid and session_manager.has_session(params_sid)
                 and not session_manager.is_leased(params_sid)):
-            _so = getattr(session_manager.get_session(params_sid), 'opt', None)
-            if (not _explicit_pacing) or _session_matches(_so):
+            _sess = session_manager.get_session(params_sid)
+            _so = getattr(_sess, 'opt', None)
+            if _session_player_closed(_sess):
+                logger.info("[session] reuse skipped: player closed sessionid=%s", params_sid)
+                try:
+                    if not self.session_has_live_pc(params_sid, require_connected=True):
+                        session_manager.remove_session(params_sid)
+                except Exception:
+                    pass
+            elif (not _explicit_pacing) or _session_matches(_so):
                 sessionid = params_sid
             else:
                 logger.info("[session] 试参与会话不符，重建会话 sessionid=%s", params_sid)
@@ -550,6 +569,9 @@ class RTCManager:
                 if self.session_has_live_pc(sid, require_connected=True):
                     continue
                 sess = session_manager.get_session(sid)
+                if _session_player_closed(sess):
+                    logger.info("[session] reuse skipped: player closed sessionid=%s", sid)
+                    continue
                 sess_opt = getattr(sess, 'opt', None)
                 if getattr(sess_opt, 'avatar_id', None) != want_avatar:
                     continue

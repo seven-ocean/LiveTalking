@@ -806,6 +806,11 @@ class HumanPlayer:
         return self.__audio
 
     @property
+    def closed(self) -> bool:
+        """会话 player 是否已关闭；复用时必须跳过，否则会一直重复最后一帧。"""
+        return self.__closed
+
+    @property
     def video(self) -> MediaStreamTrack:
         """
         A :class:`aiortc.MediaStreamTrack` instance if the file contains video.
