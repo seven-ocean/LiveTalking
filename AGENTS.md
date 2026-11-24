@@ -53,6 +53,23 @@ python3 tests/test_sdp_sanitize.py
 - WS 降级 `ws_video.py` 复用 sessionid；原会话被 reaper 回收时允许不带 sessionid 自建/选最近会话。
 - 不要删除 `isStandbyActive` 相关的服务端兼容（视频源切换）。
 
+## WebRTC 码率护栏（2026-11-24）
+
+- 参数来源：AI 能力中心 → human（数字人推理）→ `default_params.launch`
+  （`webrtc_bitrate`/`webrtc_min_bitrate` kbps，`webrtc_bitrate_cap_factor`、
+  `webrtc_maxrate_factor`、`webrtc_bufsize_ms`），保存后写 `runtime/conf/zl-talking.launch.json`。
+  `app.py` **优先 CLI，其次直接读该 launch.json**（客户现场 ops.sh 可能未更新，不要去覆盖客户的启动脚本），
+  再回落环境变量/代码默认。改完需重启 zl-talking。
+- `server/rtc_bitrate_guard.py` 是运行时 monkeypatch（aiortc 1.14.0）：
+  - `target_bitrate` setter 夹在 `[最低码率, 目标 × 上探倍数]`，REMB 不能再顶到 4.5M；
+  - 编码器重建时给 libx264 设 `maxrate = 上限 × 峰值倍数`、`bufsize = 上限 × 窗口`；
+  - 目标码率变化小于 25% 不重建编码器（避免 REMB 抖动造成 IDR 风暴），累计目标超过阈值才重建；
+  - `ZL_WEBRTC_RC_GUARD=0` 可整体关闭，`ZL_WEBRTC_RC_REBUILD_RATIO` 调整重建阈值。
+- 验收看 `[perf]`：`vcap` = 上探上限，`vtb` = 当前编码目标，`vbps` = 只统计 `outbound-rtp`
+  的真实视频码率，`kf` = 5s 内关键帧/重建次数。正常：`vtb ≤ vcap`、`vbps` 在目标附近、
+  `kf ≤ 1~2/5s`、`vgap≈40ms`、`dropped=0`。
+- 不要直接改 venv 里的 aiortc 文件；护栏必须在进程内安装，升级 aiortc 时先回归本文件。
+
 ## 离线约束
 
 - 不使用公网 STUN/TURN；`TURN_ICE_SERVERS` 服务端可为空。

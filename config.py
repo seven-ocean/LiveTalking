@@ -78,6 +78,28 @@ def parse_args():
     parser.add_argument('--listenport', type=int, default=8010,
                         help="web listen port")
 
+    # ─── WebRTC 视频码率护栏（AI 能力中心 → 数字人推理 → launch） ─────
+    parser.add_argument(
+        '--webrtc_bitrate', type=int, default=0,
+        help="WebRTC 视频目标码率，单位 kbps；0=沿用 ZL_WEBRTC_BITRATE 环境变量/代码默认",
+    )
+    parser.add_argument(
+        '--webrtc_min_bitrate', type=int, default=0,
+        help="WebRTC 最低码率，单位 kbps；0=沿用 ZL_WEBRTC_H264_MIN_BITRATE",
+    )
+    parser.add_argument(
+        '--webrtc_bitrate_cap_factor', type=float, default=0.0,
+        help="REMB 上探上限倍数：码率最高 = 目标 × 该值；0=默认 1.5",
+    )
+    parser.add_argument(
+        '--webrtc_maxrate_factor', type=float, default=0.0,
+        help="x264 maxrate 倍数：maxrate = 上限码率 × 该值；0=默认 1.2",
+    )
+    parser.add_argument(
+        '--webrtc_bufsize_ms', type=float, default=0.0,
+        help="x264 bufsize 窗口，单位毫秒；0=默认 200",
+    )
+
     # ─── WebRTC / ICE / TURN ───────────────────────────────────────────
     parser.add_argument(
         '--ice_servers',

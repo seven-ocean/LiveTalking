@@ -485,6 +485,28 @@ class HumanPlayer:
         except (TypeError, ValueError):
             self.audio_rate = DEFAULT_PLAYBACK_RATE
 
+        # ── WebRTC 码率护栏参数（AI 能力中心 → 数字人推理 → launch） ──
+        _opt = getattr(avatar_session, 'opt', None)
+
+        def _opt_float(name, default):
+            try:
+                return float(getattr(_opt, name, default) or default)
+            except (TypeError, ValueError):
+                return float(default)
+
+        def _opt_int(name, default):
+            try:
+                return int(getattr(_opt, name, default) or default)
+            except (TypeError, ValueError):
+                return int(default)
+
+        self.webrtc_cap_factor = _opt_float('webrtc_bitrate_cap_factor', 1.5)
+        self.webrtc_maxrate_factor = _opt_float('webrtc_maxrate_factor', 1.2)
+        self.webrtc_bufsize_ms = _opt_float('webrtc_bufsize_ms', 200)
+        self.webrtc_min_bitrate = _opt_int('webrtc_min_bitrate', 0)
+        self.vcap = 0
+        self.kf_n = 0
+
         self.__container = avatar_session
         if hasattr(self.__container, 'output'):
             self.__container.output._player = self
@@ -538,7 +560,7 @@ class HumanPlayer:
                 mylogger.info(
                     "[perf] session=%s fps=%.1f produced_v=%d produced_a=%d sent_seq=%d "
                     "vq=%d aq=%d wsq=%d dropped=%d audio_sent=%d audio_drop=%d "
-                    "asent=%d silence_fill=%d audio_underrun=%d dup=%d scale=%.2f vbps=%.0f vtb=%d "
+                    "asent=%d silence_fill=%d audio_underrun=%d dup=%d scale=%.2f vbps=%.0f vtb=%d vcap=%d kf=%d "
                     "aqMax=%d qWait=%.1f/%.1fms gap=%.1f/%.1fms burst=%.1f/%.0f "
                     "vgap=%.1f/%.1fms enc=%.1f/%.1fms",
                     getattr(self.__container, "sessionid", "-"), fps,
@@ -553,6 +575,8 @@ class HumanPlayer:
                     self.webrtc_scale,
                     getattr(self, "vbps", 0.0) / 1000.0,
                     int(getattr(self, "vtb", 0) or 0),
+                    int(getattr(self, "vcap", 0) or 0),
+                    int(getattr(self, "kf_n", 0) or 0),
                     int(getattr(self, "aq_max", 0)),
                     (getattr(self.__audio, "_stat_qwait_sum", 0.0) /
                      max(1, getattr(self.__audio, "_stat_qwait_n", 1)) * 1000.0),
@@ -575,6 +599,7 @@ class HumanPlayer:
                 self._enc_sum = 0.0
                 self._enc_max = 0.0
                 self.aq_max = 0
+                self.kf_n = 0
                 self._burst_n = 0
                 self._burst_frames_sum = 0
                 self._burst_interval_sum = 0.0

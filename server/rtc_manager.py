@@ -43,6 +43,12 @@ try:
 except Exception:
     pass
 
+try:
+    from server.rtc_bitrate_guard import install_bitrate_guard
+except ImportError:  # direct script execution
+    from rtc_bitrate_guard import install_bitrate_guard
+install_bitrate_guard()
+
 from utils.logger import logger, get_webrtc_logger
 from utils.hardware_monitor import log_resource_snapshot
 
@@ -161,6 +167,21 @@ async def _enforce_bitrate_cap(player, pc, cap_bps: int) -> None:
     for _ in range(200):          # 最多等 10s
         enc = getattr(sender, '_RTCRtpSender__encoder', None)
         if enc is not None:
+            try:
+                enc._zl_cap_bps = int(cap_bps)
+                enc._zl_desired_bps = int(cap_bps)
+                enc._zl_player = player
+                player._zl_force_cap = int(cap_bps)
+                if not getattr(enc, '_zl_min_bps', 0):
+                    enc._zl_min_bps = int(getattr(player, 'webrtc_min_bitrate', 0) or 0)
+                if not getattr(enc, '_zl_maxrate_factor', 0):
+                    enc._zl_maxrate_factor = float(
+                        getattr(player, 'webrtc_maxrate_factor', 0) or 1.2)
+                if not getattr(enc, '_zl_bufsize_ms', 0):
+                    enc._zl_bufsize_ms = float(
+                        getattr(player, 'webrtc_bufsize_ms', 0) or 200)
+            except Exception:
+                pass
             _force_target_bitrate(enc, cap_bps)
             _wrap_encode_timing(player, enc)
             return
@@ -196,12 +217,30 @@ async def _apply_video_bitrate(player) -> None:
     sender = getattr(player, 'video_sender', None)
     if not sender or bitrate <= 0:
         return
+    forced = int(getattr(player, '_zl_force_cap', 0) or 0)
+    if forced > 0:
+        bitrate = forced
+    cap_factor = float(getattr(player, 'webrtc_cap_factor', 0) or 1.5)
+    cap_bps = forced if forced > 0 else int(bitrate * max(1.0, cap_factor))
     for _ in range(200):          # 最多等 10s
         enc = getattr(sender, '_RTCRtpSender__encoder', None)
         if enc is not None and hasattr(enc, 'target_bitrate'):
             try:
+                # 护栏参数（server.rtc_bitrate_guard 读取）
+                enc._zl_cap_bps = cap_bps
+                enc._zl_min_bps = int(getattr(player, 'webrtc_min_bitrate', 0) or 0)
+                enc._zl_maxrate_factor = float(
+                    getattr(player, 'webrtc_maxrate_factor', 0) or 1.2)
+                enc._zl_bufsize_ms = float(
+                    getattr(player, 'webrtc_bufsize_ms', 0) or 200)
+                enc._zl_player = player
                 enc.target_bitrate = bitrate
-                logger.info('[webrtc] video target_bitrate -> %d bps', bitrate)
+                player.vcap = cap_bps
+                logger.info(
+                    '[webrtc] video bitrate guard: target=%d cap=%d(min=%.2fx) '
+                    'min=%d maxrate=%.2fx bufsize=%.0fms',
+                    bitrate, cap_bps, cap_factor,
+                    enc._zl_min_bps, enc._zl_maxrate_factor, enc._zl_bufsize_ms)
             except Exception:
                 pass
             return
@@ -230,9 +269,17 @@ async def _sender_stats_loop(player, pc) -> None:
                 except Exception:
                     vals = None
             if vals is not None:
-                total = sum(int(getattr(x, 'bytesSent', 0) or 0) for x in vals)
+                # 只统计 outbound-rtp：transport 统计里的 bytesSent 是整条 ICE
+                # （含音频/重传），直接求和会把视频码率算高一倍。
+                total = sum(
+                    int(getattr(x, 'bytesSent', 0) or 0)
+                    for x in vals if getattr(x, 'type', '') == 'outbound-rtp'
+                )
             elif isinstance(st, (list, tuple)):
-                total = sum(int(getattr(x, 'bytesSent', 0) or 0) for x in st)
+                total = sum(
+                    int(getattr(x, 'bytesSent', 0) or 0)
+                    for x in st if getattr(x, 'type', '') == 'outbound-rtp'
+                )
             else:
                 total = int(getattr(st, 'bytesSent', 0) or 0)
             now = time.monotonic()
@@ -240,6 +287,7 @@ async def _sender_stats_loop(player, pc) -> None:
             last_bytes, last_t = total, now
             enc = getattr(sender, '_RTCRtpSender__encoder', None)
             player.vtb = int(getattr(enc, 'target_bitrate', 0) or 0) if enc is not None else 0
+            player.vcap = int(getattr(enc, '_zl_cap_bps', 0) or 0) if enc is not None else 0
         except Exception:
             continue
 

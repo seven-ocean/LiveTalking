@@ -722,22 +722,97 @@ def build_avatar_session(sessionid:str, params:dict)->BaseAvatar:
         fps = int(getattr(opt, 'fps', 25) or 25)
     except (TypeError, ValueError):
         fps = 25
+    # 能力中心「数字人推理 → WebRTC 视频码率」优先走 CLI（ops.sh 映射）；
+    # 客户现场 ops.sh 可能未更新，这里再直接读 zl-talking.launch.json 作为兜底，
+    # 避免为了几个码率参数去覆盖客户的启动脚本。
+    launch_overrides = {}
+    try:
+        launch_file = os.environ.get('ZL_TALKING_LAUNCH_FILE')
+        if not launch_file:
+            _root = os.environ.get('AIHUMAN_ROOT')
+            if _root:
+                launch_file = os.path.join(_root, 'runtime', 'conf', 'zl-talking.launch.json')
+            else:
+                launch_file = os.path.join(os.getcwd(), '..', 'runtime', 'conf',
+                                           'zl-talking.launch.json')
+        with open(launch_file, encoding='utf-8') as _lf:
+            _data = json.load(_lf)
+        if isinstance(_data, dict):
+            launch_overrides = _data
+    except Exception:
+        launch_overrides = {}
+
+    def _override_int(name, default=0):
+        try:
+            value = int(getattr(opt, name, 0) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        if value:
+            return value
+        raw = launch_overrides.get(name)
+        if raw is None or str(raw).strip() == '':
+            return default
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return default
+
+    def _override_float(name, default):
+        try:
+            value = float(getattr(opt, name, 0) or 0)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value:
+            return value
+        raw = launch_overrides.get(name)
+        if raw is None or str(raw).strip() == '':
+            return default
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return default
+
     try:
         max_bitrate = int(os.environ.get('ZL_WEBRTC_MAX_BITRATE', '8000000') or 8000000)
     except (TypeError, ValueError):
         max_bitrate = 8000000
-    try:
-        bitrate = int(os.environ.get('ZL_WEBRTC_BITRATE', '2000000') or 2000000)
-    except (TypeError, ValueError):
-        bitrate = 2000000
+    cli_bitrate_kbps = _override_int('webrtc_bitrate', 0)
+    if cli_bitrate_kbps > 0:
+        bitrate = cli_bitrate_kbps * 1000
+    else:
+        try:
+            bitrate = int(os.environ.get('ZL_WEBRTC_BITRATE', '2000000') or 2000000)
+        except (TypeError, ValueError):
+            bitrate = 2000000
     bitrate = max(500000, min(bitrate, max_bitrate))
+
+    cli_min_kbps = _override_int('webrtc_min_bitrate', 0)
+    cap_factor = max(1.0, _override_float('webrtc_bitrate_cap_factor', 1.5))
+    maxrate_factor = max(1.0, _override_float('webrtc_maxrate_factor', 1.2))
+    bufsize_ms = max(50.0, _override_float('webrtc_bufsize_ms', 200.0))
+    try:
+        env_min = int(os.environ.get('ZL_WEBRTC_H264_MIN_BITRATE', '750000') or 750000)
+    except (TypeError, ValueError):
+        env_min = 750000
+    min_bps = cli_min_kbps * 1000 if cli_min_kbps > 0 else env_min
+    min_bps = max(0, min(min_bps, bitrate))
 
     opt_this.webrtc_scale = 1.0
     opt_this.video_fps = fps
     opt_this.video_bitrate = bitrate
+    opt_this.webrtc_min_bitrate = min_bps
+    opt_this.webrtc_bitrate_cap_factor = cap_factor
+    opt_this.webrtc_maxrate_factor = maxrate_factor
+    opt_this.webrtc_bufsize_ms = bufsize_ms
     if native:
-        logger.info('[session] %s 直出 video=%dx%d(short=%d) @%.1fMbps %dfps（不缩放/不降帧）',
+        logger.info('[session] %s 直出 video=%dx%d(short=%d) @%.2fMbps %dfps（不缩放/不降帧）',
                     sessionid, nw, nh, short, bitrate / 1e6, fps)
+    logger.info(
+        '[session] %s 码率护栏: target=%.2fMbps cap=%.2fMbps(%.2fx) min=%.2fMbps '
+        'maxrate=%.2fMbps bufsize=%.0fms',
+        sessionid, bitrate / 1e6, bitrate * cap_factor / 1e6, cap_factor,
+        min_bps / 1e6,
+        bitrate * cap_factor * maxrate_factor / 1e6, bufsize_ms)
 
     # 产出节流模式（URL 试参，只影响本会话；默认 legacy = 原有行为）
     _pacing = str(params.get('pacing') or '').strip().lower()
