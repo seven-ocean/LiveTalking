@@ -83,3 +83,6 @@ python3 tests/test_sdp_sanitize.py
 - 不使用公网 STUN/TURN；`TURN_ICE_SERVERS` 服务端可为空。
 - 不下载模型/依赖；使用本地 models/wheels。
 - 不改 `runtime/conf`；配置由安装包/ops.sh 管理。
+- `web/` 页面只允许引用 `web/vendor/` 下的本地静态资源（Bootstrap 5.3、Bootstrap Icons 1.10、
+  jQuery 3.6/2.1.1、SockJS、Inter 字体）；禁止新增 CDN、Google Fonts、code.jquery.com 等在线地址。
+  新增页面资源时先落到 `web/vendor/` 再引用。

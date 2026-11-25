@@ -1110,7 +1110,7 @@ def main():
         rendthrd.start()
 
     #############################################################################
-    appasync = web.Application(client_max_size=1024**2*100)
+    appasync = web.Application(client_max_size=1024**3*8)
     appasync["llm_response"] = llm_response
     appasync["opt"] = opt
     appasync["rtc_manager"] = rtc_manager
