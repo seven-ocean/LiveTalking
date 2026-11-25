@@ -369,10 +369,10 @@ async def _health_loop():
 # ─── 网关路由分派 ──────────────────────────────────────────────────────────
 
 async def _try_evict_idle(opt, aggressive: bool = False):
-    """满员时让 worker 回收一个会话，成功则乐观减一，返回可用下标。
+    """满员时让 worker 回收一个空闲会话，成功则乐观减一，返回可用下标。
 
-    aggressive=True 时带 `oldest=1`：没有真正空闲的会话，就按 LRU 释放最旧会话，
-    保证已经在排队的新用户能连入。
+    aggressive=True 时带 `oldest=1`：放宽空闲时长阈值，优先给排队的新用户腾位置；
+    但 worker 侧仍只回收「无活 PC、无 WS 租约」的会话，不会踢掉在线用户。
     """
     idle = os.environ.get("TALK_EVICT_IDLE_SECONDS", "10")
     query = "/evict_idle?idle=%s%s" % (idle, "&oldest=1" if aggressive else "")
@@ -414,7 +414,8 @@ async def _pick_offer_worker(opt):
         idx, state.rr = pick_worker(state.workers, opt.gpu_ids_strategy,
                                     state.rr, opt.lb_max_session_per_gpu)
         if idx is None:
-            # [fix-publish-webrtc]:4e6ca365c5 满员时先回收一个会话，别让新用户干等
+            # 满员时只回收「无活 PC、无租约」的空闲会话；不抢在线用户，
+            # 没有可回收的就返回排队响应，由前端重试。
             idx = await _try_evict_idle(opt, aggressive=True)
         if idx is None:
             return None

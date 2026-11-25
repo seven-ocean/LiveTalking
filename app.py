@@ -1182,8 +1182,9 @@ def main():
     async def evict_idle_session(request):
         """LB 满员时调用：回收一个会话。
 
-        默认只回收「无租约、无活 PC、空闲≥阈值」的会话；
-        `oldest=1` 时放宽为按 LRU 释放最旧会话（有用户排队时用，保证新用户能连入）。
+        只回收「无租约、无活 PC」的会话；`oldest=1` 时放宽空闲时长阈值，
+        但**绝不**回收仍有活 PC / 被 WS 租用的会话（否则在线用户画面冻结）。
+        没有可回收会话时返回 code=1，由 LB 返回排队响应。
         """
         aggressive = (request.query.get("oldest", "0").strip().lower()
                       in ("1", "true", "yes", "on"))
@@ -1194,20 +1195,15 @@ def main():
 
         def _free(sid):
             try:
-                return (not session_manager.is_leased(sid)
-                        and not rtc_manager.session_has_live_pc(sid)
-                        and session_manager.idle_seconds(sid) >= threshold)
+                if session_manager.is_leased(sid) or rtc_manager.session_has_live_pc(sid):
+                    return False
+                # 激进模式只放宽“空闲多久”，仍然要求没有活 PC / 租约
+                return aggressive or session_manager.idle_seconds(sid) >= threshold
             except Exception:
                 return False
 
         mode = "oldest" if aggressive else "idle"
-        if aggressive:
-            # 先找真正空闲的；没有就按 LRU 释放最旧会话（新用户已在排队）
-            sid = (session_manager.evict_oldest(predicate=_free)
-                   or session_manager.evict_oldest())
-        else:
-            sid = session_manager.evict_oldest(predicate=_free)
-
+        sid = session_manager.evict_oldest(predicate=_free)
         if not sid:
             return web.json_response({"code": 1, "msg": "no idle session"})
         try:

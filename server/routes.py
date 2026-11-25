@@ -50,6 +50,7 @@ async def human(request):
         avatar_session = get_session(request, sessionid)
         if avatar_session is None:
             return json_error("session not found")
+        session_manager.touch(sessionid)
 
         if params.get('interrupt'):
             avatar_session.flush_talk()
@@ -81,6 +82,7 @@ async def interrupt_talk(request):
         avatar_session = get_session(request, sessionid)
         if avatar_session is None:
             return json_error("session not found")
+        session_manager.touch(sessionid)
         avatar_session.flush_talk()
         return json_ok()
     except Exception as e:
@@ -101,6 +103,7 @@ async def humanaudio(request):
         avatar_session = get_session(request, sessionid)
         if avatar_session is None:
             return json_error("session not found")
+        session_manager.touch(sessionid)
         avatar_session.put_audio_file(filebytes, datainfo)
         return json_ok()
     except Exception as e:
@@ -116,6 +119,7 @@ async def set_audiotype(request):
         avatar_session = get_session(request, sessionid)
         if avatar_session is None:
             return json_error("session not found")
+        session_manager.touch(sessionid)
         avatar_session.set_custom_state(params['audiotype'])
         return json_ok()
     except Exception as e:
@@ -131,6 +135,7 @@ async def record(request):
         avatar_session = get_session(request, sessionid)
         if avatar_session is None:
             return json_error("session not found")
+        session_manager.touch(sessionid)
         if params['type'] == 'start_record':
             avatar_session.start_recording()
         elif params['type'] == 'end_record':
@@ -148,6 +153,7 @@ async def is_speaking(request):
     avatar_session = get_session(request, sessionid)
     if avatar_session is None:
         return json_error("session not found")
+    session_manager.touch(sessionid)
     return json_ok(data=avatar_session.is_speaking())
 
 
@@ -222,6 +228,17 @@ async def stop_session(request):
         sessionid = params.get('sessionid', '')
         session_manager.stop_session(sessionid)
         session_manager.remove_session(sessionid)
+        # 释放会话时把残留的 pc 一并关掉，否则 track 会重新拉起 render 循环（表现为越切越卡）
+        rtc_manager = request.app.get("rtc_manager")
+        if rtc_manager is not None:
+            try:
+                await rtc_manager.drop_session_pcs(sessionid)
+            except Exception:
+                logger.exception('stop_session drop pc failed sessionid=%s', sessionid)
+            try:
+                rtc_manager.session_tab.pop(sessionid, None)
+            except Exception:
+                pass
         return json_ok()
     except Exception as e:
         logger.exception('stop_session exception:')

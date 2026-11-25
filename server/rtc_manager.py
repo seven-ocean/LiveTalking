@@ -401,10 +401,12 @@ class RTCManager:
             return 2
 
     def _has_capacity(self, exclude_sid: str = "") -> bool:
-        """判断能否再建新会话；满员时按 LRU 释放一个最旧会话。
+        """判断能否再建新会话；满员时最多回收「真正空闲」的会话。
 
-        两级策略：优先释放「无活 PC、无 WS 租用」的会话；没有才动最旧的活跃会话。
-        默认允许“来一个排队就踢最旧”，TALK_QUEUE_EVICT=0 可关闭。
+        只允许回收：无 WS 租约、无活 PC、且空闲超过 TALK_QUEUE_EVICT_IDLE_SECONDS 的会话。
+        仍在出画面/被 WS 降级通道占用的会话一律不动 —— 否则会出现
+        「新页面建连把在线用户的会话踢掉，画面冻结、/humanaudio 报 session not found」。
+        没有可回收会话时返回 False，由调用方返回 503 排队响应。
         """
         limit = self._max_sessions()
         if len(session_manager.sessions) < limit:
@@ -412,24 +414,27 @@ class RTCManager:
         if os.environ.get("TALK_QUEUE_EVICT", "1").strip().lower() in ("0", "false", "no", "off"):
             return False
 
+        try:
+            threshold = float(os.environ.get("TALK_QUEUE_EVICT_IDLE_SECONDS", "5"))
+        except (TypeError, ValueError):
+            threshold = 5.0
+
         def _free(sid):
             try:
                 return (not session_manager.is_leased(sid)
-                        and not self.session_has_live_pc(sid))
+                        and not self.session_has_live_pc(sid)
+                        and session_manager.idle_seconds(sid) >= threshold)
             except Exception:
                 return False
 
-        def _not_leased(sid):
-            try:
-                return not session_manager.is_leased(sid)
-            except Exception:
-                return False
-
-        evicted = (session_manager.evict_oldest(exclude=exclude_sid, predicate=_free)
-                   or session_manager.evict_oldest(exclude=exclude_sid, predicate=_not_leased)
-                   or session_manager.evict_oldest(exclude=exclude_sid))
+        evicted = session_manager.evict_oldest(exclude=exclude_sid, predicate=_free)
         if evicted:
-            logger.info("[capacity] 满员（上限 %d），已释放最旧会话 sessionid=%s", limit, evicted)
+            logger.info("[capacity] 满员（上限 %d），已回收空闲会话 sessionid=%s", limit, evicted)
+            # 回收的是「无活 PC」的会话，但 failed/closed 的 pc 可能还挂在 self.pcs 里
+            try:
+                asyncio.ensure_future(self.drop_session_pcs(evicted))
+            except Exception:
+                logger.exception("[capacity] drop evicted session pc failed sessionid=%s", evicted)
         return len(session_manager.sessions) < limit
 
     def _capacity_response(self) -> web.Response:

@@ -231,7 +231,9 @@ class SessionManager:
 
     def mark_pending_destroy(self, sessionid: str):
         """pc 关闭时发现会话仍被租用，记录待销毁，待租约释放后再清理。"""
-        self.pending_destroy.add(sessionid)
+        # 会话已被显式释放（/stop_session、容量回收）时不要再登记，避免 pending_destroy 泄漏
+        if self.has_session(sessionid):
+            self.pending_destroy.add(sessionid)
 
     def release_session(self, sessionid: str) -> bool:
         """释放一次租约；返回 True 表示此前有被推迟的销毁需要调用方立刻执行。"""

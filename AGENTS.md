@@ -52,6 +52,14 @@ python3 tests/test_sdp_sanitize.py
 - `REUSE_SESSION_ON_OFFER` 复用前检查 `HumanPlayer.closed`；已关闭 player 不能复用。
 - WS 降级 `ws_video.py` 复用 sessionid；原会话被 reaper 回收时允许不带 sessionid 自建/选最近会话。
 - 不要删除 `isStandbyActive` 相关的服务端兼容（视频源切换）。
+- **容量回收不抢在线会话**（2026-11-25）：
+  - `/human`、`/humanaudio`、`/interrupt_talk`、`/is_speaking`、`/set_audiotype`、`/record` 必须
+    `session_manager.touch(sessionid)`；否则 `/metrics` 的 `idle` 永远停在创建时刻，LRU 会把在线会话当最旧。
+  - `_has_capacity()` / `evict_idle_session()` / gpu_lb 满员回收只能动「无活 PC + 无 WS 租约 +
+    空闲 ≥ `TALK_QUEUE_EVICT_IDLE_SECONDS`（默认 5s）」的会话；没有就返回 503 `queue=true` 排队。
+    绝不能有无条件 `evict_oldest()` 兜底——单卡 `max_session=1` 时会把正在出画面的用户踢掉，
+    表现为画面冻结、zl-ai `/humanaudio` 报 `session not found`。
+  - `/stop_session` 必须 `drop_session_pcs()`，否则 track 会重新拉起 render 循环。
 
 ## WebRTC 码率护栏（2026-11-24）
 
